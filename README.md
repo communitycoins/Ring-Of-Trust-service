@@ -19,3 +19,15 @@ Within the context of CommunityCoins, as of June 22, 2024, there are no SPV serv
 - Creating a docker-image for each community coin would stimualate the proppagation of individual rings.
 
 The procedure to implement the network and verify trust is not yet described, but can easiliy be implemented. To bootstrap a ring  initially simple publication would suffice. 
+
+Two articles further motivate design choices for the ROT-implementation
+- Why We Choose Legacy: https://medium.com/@support_4739/why-we-choose-legacy-3376b8f9415c
+- Rethinking SPV: https://medium.com/@support_4739/rethinking-spv-toward-a-stateless-peer-verified-backend-layer-for-blockchain-light-clients-7fd5e2906601
+
+## Source
+
+### [blockparser.php])(./blockparser.php)
+Index builder for SPV-services that serve legacy-only light clients P2PKH-addresses.
+- Use a pipe-delimited configuration file: buildchain.conf
+list($coin,$user,$ww,$port,$conf,$datadir,$magic)=explode("|",file_get_contents(ROOT."buildchain.conf"));
+
