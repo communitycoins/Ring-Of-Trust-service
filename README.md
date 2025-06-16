@@ -29,6 +29,12 @@ Two articles further motivate design choices for the ROT-implementation
 ### blockparser.php
 
 Index builder for SPV-services that serve legacy-only light clients P2PKH-addresses.
-- Use a pipe-delimited configuration file: buildchain.conf
-list($coin,$user,$ww,$port,$conf,$datadir,$magic)=explode("|",file_get_contents(ROOT."buildchain.conf"));
-
+- Use a single line pipe-delimited configuration file: buildchain.conf 
+  - coin-name| 
+  - rpc-user|
+  - rpc-ww|
+  - rpc-port|
+  - block confirmations| (not used)
+  - block data directory|
+  - magic bytes| (4-bytes block separator)
+  - version (base50 version byte; not used)
