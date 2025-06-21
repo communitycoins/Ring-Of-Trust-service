@@ -42,17 +42,20 @@
 
 define("LOG","blockparser.log");
 define("ROOT",dirname(__FILE__)."/");
+define("Q",ROOT."Q");
+define("A",ROOT."A");
+if (!file_exists(Q)) {mkdir(Q);}
+if (!file_exists(A)) {mkdir(A);}
 
 function now(){return date('d-m-Y H:i');}
 function L($what){file_put_contents(LOG,$what,FILE_APPEND);echo $what;}
 
 $start=time();
 L("==== Start ".now()." ====\n\n");
-@unlink(LOG); 
 @unlink("TXidx");
 @unlink("BLKidx");
 
-list($coin,$user,$ww,$port,$conf,$datadir,$magic)=explode("|",file_get_contents(ROOT."buildchain.conf"));
+list($coin,$user,$ww,$port,$conf,$datadir,$magic,$version)=explode("|",file_get_contents(ROOT."buildchain.conf"));
 define ("MAGIC",hex2bin($magic));
 
 if (substr($datadir,-1)!="/") {$datadir.="/";}
@@ -84,7 +87,7 @@ $raceToTheTop=true;$raceStatus=$raceToTheTop; // Switches 'off' when top is reac
 $fullBackup=false; // Switches 'on' when top is reached
 $lastBlockHash=""; // Last block indexed
 $blockbuffer=[];   // non-sequential encountered blocks
-$max_buffer=$orphan=$blkvalid=$loop=$skipped=$relevant=0;
+$max_buffer=$orphan=$blkvalid=$skipped=$relevant=0;
 $TXidx="";$TXdata="";$TX_sum=0;$BLKidx="";
 
 $recovery=false;
@@ -108,6 +111,8 @@ if (file_exists(ROOT."AUX")){ // Recover...
     }
 }
 if (!$recovery){
+    $parseContext['currentFile']='';
+    $parseContext['offset']=0;
     $TX_table['name']			="TX";
     $TX_table['N']			=10000000;   // hash-positions (4-bytes a piece) -> 40Mb
     $TX_table['increment']              =100000000;  // increment empty space to prevent frequent reallocations (100 Mb)                                        
@@ -174,12 +179,13 @@ if (!$recovery){
 
 $parser = new BlockParser();
 $tipTarget=count($BLOCKINDEX->hashMap);
+L("Race to the top ...\n");
 foreach (extractBlocksFromStream($datadir) as $entry) {
     /* Two situations are inter-twined:
        raceToTheTop=true : truth about the chain block-sequence is in hashMap. $entry['id'] is the block height; No fork-blocks will appear
                            Blocks received out of sequence are stored in $blockbuffer
        raceToTheTop=false: we are at the top. We got the block streight through RPC. So this is the new truth.
-                           Just see if it convenes with the old trhuth, otherwise rewind.
+                           Just see if it convenes with the old truth, otherwise rewind.
     */
     if ($raceStatus!=$raceToTheTop){
         if (!$fullBackup) {
@@ -217,7 +223,20 @@ foreach (extractBlocksFromStream($datadir) as $entry) {
         }
     }
     while ($entry['id']==$height) {
-        $loop++;
+        if (($raceToTheTop && ($height%10000)==1)) {
+            if ($height>100) {
+                $passed=time()-$start;
+                $len_buffer=count($blockbuffer);
+                L("blk.dat:{$entry['fileNumber']} height:$height seconds:$passed buffer_max:$max_buffer buffer:$len_buffer orphans:$orphan valid:$blkvalid skipped:$skipped relevant:$relevant\n");
+                if (!$fullBackup){
+                    file_put_contents("TXdata",$TXdata,FILE_APPEND); // will store all transactions processed
+                    file_put_contents("TXidx",$TXidx,FILE_APPEND);   // per block, pointer to first transaction
+                    file_put_contents("BLKidx",$BLKidx,FILE_APPEND); // for each block a 6-byte pointer into blk*.dat
+                    $TXidx="";$TXdata="";$BLKidx="";
+                }
+            }
+        }    
+        
         $lastBlockHash=$entry['hash'];
         if (($height>=$BLOCKINDEX->backupHeight) && (($height%$BLOCKINDEX->maxReorgDepth)==0)) {
             $parseContext['hash']=$entry['prevHash'];
@@ -289,19 +308,6 @@ foreach (extractBlocksFromStream($datadir) as $entry) {
             }
         }
     }
-    if (($raceToTheTop && ($loop%100000)==1)) {
-        if ($height>100) {
-            $passed=time()-$start;
-            $len_buffer=count($blockbuffer);
-            L("blk.dat:{$entry['fileNumber']} height:$height seconds:$passed buffer_max:$max_buffer buffer:$len_buffer orphans:$orphan valid:$blkvalid skipped:$skipped relevant:$relevant\n");
-            if (!$fullBackup){
-                file_put_contents("TXdata",$TXdata,FILE_APPEND); // will store all transactions processed
-                file_put_contents("TXidx",$TXidx,FILE_APPEND);   // per block, pointer to first transaction
-                file_put_contents("BLKidx",$BLKidx,FILE_APPEND); // for each block a 6-byte pointer into blk*.dat
-                $TXidx="";$TXdata="";$BLKidx="";
-            }
-        }
-    }    
 }
 // This will not be reached
 echo "If you are in doubt just confess...";
@@ -332,7 +338,7 @@ function extractBlocksFromStream(string $directory): Generator {
     $fileNrPos=strlen($directory)+4;
     $fileNumber=0;
     if ($parseContext['currentFile']=="") {
-        $currentFile="$directory/blk00000.dat";
+        $currentFile="{$directory}blk00000.dat";
         $offset=0;
     } else {
         $currentFile=$parseContext['currentFile'];
@@ -607,8 +613,8 @@ class BlockIndex { /* loads all blockhashes through RPC;
         $once=true;
         while (true) {
             $tipHash   = $RPC->call('getbestblockhash', []);
-            $tipHeader = $RPC->call('getblockheader', [$tipHash]);
-            $lag       = time() - $tipHeader['time'];
+            $tip = $RPC->call('getblock', [$tipHash]);
+            $lag       = time() - $tip['time'];
             if ($lag < 3600) {break;} else {if ($once) {$once=false;L("Waiting for Core to sync...");}}
             sleep(60);
         }
@@ -617,6 +623,7 @@ class BlockIndex { /* loads all blockhashes through RPC;
 
 class BlockParser { /* Unravels a binary block */
     public function getBlock(string $buffer): array {
+        global $height;
         $offset = 0;
         $version = unpack("V", substr($buffer, $offset, 4))[1];
         $offset += 4;    
@@ -639,7 +646,7 @@ class BlockParser { /* Unravels a binary block */
             'nonce' => $nonce
         ];
         $offset = 80; // Skip block header just for clarity
-        if ($version & (1 << 8)) {skipAuxPowHeader($buffer, $offset);}
+        if ($version & (1 << 8)) {$this->skipAuxPowHeader($buffer, $offset);}
         
         $txCountSize = 0;
         $txCount = $this->parseVarInt($buffer, $offset, $txCountSize);
@@ -648,6 +655,7 @@ class BlockParser { /* Unravels a binary block */
         $skipped=0;
         for ($i = 0; $i < $txCount; $i++) {
             $tx = $this->parseTransactionLite($buffer, $offset);
+            
             $tx['original']=$i; // to track skipped transactions; not used currently
             $tx['offset']=$offset;
             //$transactions[] = $tx;
@@ -744,19 +752,58 @@ class BlockParser { /* Unravels a binary block */
             'inputs' => $inputs
         ];
     }
-    private function skipAuxPowHeader($buffer, &$offset) {    
-        // 1. Skip coinbase tx (VarBytes)
-        // 2. Skip merkle branch (VarInt + hashes)
-        // 3. Skip 4-byte merkle index
-        // 4. Skip 80-byte parent block header
-        $len = readVarInt($buffer, $offset);
-        $offset += $len;    
-        $count = readVarInt($buffer, $offset);
-        $offset += 32 * $count;
+    private function skipAuxPowHeader(string $buffer, int &$offset) {
+        // 1. Skip embedded coinbase tx (AuxPoW coinbasetx)
+        $this->skipTransaction($buffer, $offset);
+        
+        $offset += 32;  // parent block hash?????
+        
+        $coinbaseBranchCount = $this->readVarInt($buffer, $offset);
+        $offset += 32 * $coinbaseBranchCount;
+    
+        $coinbaseIndex = substr($buffer, $offset, 4);
         $offset += 4;
+    
+        // 4. Now at chainMerkleBranch
+        $chainBranchCount = $this->readVarInt($buffer, $offset);
+        $offset += 32 * $chainBranchCount;
+    
+        // 5. chainIndex (4 bytes)
+        $offset += 4;
+    
+        // 6. parent block header (80 bytes)
         $offset += 80;
-    }
+    }    
+    private function skipTransaction(string $buffer, int &$offset): void {
+        // 1. version (4 bytes)
+        $offset += 4;
+    
+        // 2. inputs (vin)
+        $vinCount = $this->readVarInt($buffer, $offset);
+        for ($i = 0; $i < $vinCount; $i++) {
+            $offset += 32; // prev txid
+            $offset += 4;  // prev vout index
+    
+            $scriptLen = $this->readVarInt($buffer, $offset);
+            $offset += $scriptLen; // scriptSig
+    
+            $offset += 4; // sequence
+        }
+    
+        // 3. outputs (vout)
+        $voutCount = $this->readVarInt($buffer, $offset);
+        for ($i = 0; $i < $voutCount; $i++) {
+            $offset += 8; // value
+    
+            $scriptLen = $this->readVarInt($buffer, $offset);
+            $offset += $scriptLen; // scriptPubKey
+        }
+    
+        // 4. locktime (4 bytes)
+        $offset += 4;
+    }    
     private function parseVarInt(string $buffer, int $offset, &$size): int {
+        global $height,$parseContext;
         $first = ord($buffer[$offset]);
         if ($first < 0xfd) {
             $size = 1;
@@ -790,7 +837,7 @@ class BlockParser { /* Unravels a binary block */
         return $val;
     }
     private function parseVarBytes($buffer, &$offset) {
-        $len = readVarInt($buffer, $offset);
+        $len = $this->readVarInt($buffer, $offset);
         $data = substr($buffer, $offset, $len);
         $offset += $len;
         return [$data, $len];
