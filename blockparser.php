@@ -49,17 +49,27 @@ if (!file_exists(A)) {mkdir(A);}
 
 function now(){return date('d-m-Y H:i');}
 function L($what){file_put_contents(LOG,$what,FILE_APPEND);echo $what;}
+if (!function_exists('array_key_last')) {function array_key_last(array $array) {if (empty($array)) {return null;}return key(array_slice($array, -1, 1, true));}}
 
 $start=time();
 L("==== Start ".now()." ====\n\n");
 @unlink("TXidx");
 @unlink("BLKidx");
 
-list($coin,$user,$ww,$port,$conf,$datadir,$magic,$version)=explode("|",file_get_contents(ROOT."buildchain.conf"));
-define ("MAGIC",hex2bin($magic));
+list($tikker,$user,$ww,$port,$datadir)=explode("|",trim(file_get_contents(ROOT."buildchain.conf")));
 
 if (substr($datadir,-1)!="/") {$datadir.="/";}
-$datadir.="blocks/";
+if (file_exists("{$datadir}blocks")) {$datadir.="blocks/";}
+$blockFiles=glob("{$datadir}blk*.dat");
+if (count($blockFiles)==0) {
+    L("No block-data found: {$datadir}blk*.dat\n");
+    die();
+} else {
+    $handle=fopen($blockFiles[0],"r");
+    $magic=fread($handle,4);
+    fclose($handle);
+    define ("MAGIC",$magic);
+}
 
 $rpc = [
     'user' => $user,
@@ -116,7 +126,7 @@ if (!$recovery){
     $TX_table['name']			="TX";
     $TX_table['N']			=10000000;   // hash-positions (4-bytes a piece) -> 40Mb
     $TX_table['increment']              =100000000;  // increment empty space to prevent frequent reallocations (100 Mb)                                        
-    if (($coin=='litecoin')||($coin=='bitcoin')||($coin=='dogecoin')) {$multiplier=10;} else {$multiplier=1;}   // hash-positions -> 400Mb
+    if (($tikker=='LTC')||($tikker=='BTC')||($tikker=='DOGE')) {$multiplier=10;} else {$multiplier=1;}   // hash-positions -> 400Mb
     $TX_table['N']*=$multiplier;
     $TX_table['increment']*=$multiplier;
     
@@ -180,7 +190,7 @@ if (!$recovery){
 $parser = new BlockParser();
 $tipTarget=count($BLOCKINDEX->hashMap);
 L("Race to the top ...\n");
-foreach (extractBlocksFromStream($datadir) as $entry) {
+foreach (extractBlocksFromStream() as $entry) {
     /* Two situations are inter-twined:
        raceToTheTop=true : truth about the chain block-sequence is in hashMap. $entry['id'] is the block height; No fork-blocks will appear
                            Blocks received out of sequence are stored in $blockbuffer
@@ -223,8 +233,8 @@ foreach (extractBlocksFromStream($datadir) as $entry) {
         }
     }
     while ($entry['id']==$height) {
-        if (($raceToTheTop && ($height%10000)==1)) {
-            if ($height>100) {
+        if (($raceToTheTop && ($height%100000)==1)) {
+            if ($height>1) {
                 $passed=time()-$start;
                 $len_buffer=count($blockbuffer);
                 L("blk.dat:{$entry['fileNumber']} height:$height seconds:$passed buffer_max:$max_buffer buffer:$len_buffer orphans:$orphan valid:$blkvalid skipped:$skipped relevant:$relevant\n");
@@ -328,22 +338,28 @@ function computeBlockHash(string $header80): string {
  * If all client-requests are handled it tails the blk*.dat stream.
  *
  */
-function extractBlocksFromStream(string $directory): Generator {
-    global $RPC,$BLOCKINDEX,$raceToTheTop,$orphan,$blkvalid,$parseContext,$fullBackup,$height;
+function extractBlocksFromStream(): Generator {
+    global $RPC,$BLOCKINDEX,$raceToTheTop,$orphan,$blkvalid,$parseContext,$fullBackup,$height,$blockFiles;
     
     $coreFailure=false;
-    $pollDelayMicro = 500_000; // 0.1s; Poll delay when waiting for new data
+    $pollDelayMicro = 500000; // 0.1s; Poll delay when waiting for new data
     $tipReached=false;
     $top=count($BLOCKINDEX->hashMap);
-    $fileNrPos=strlen($directory)+4;
-    $fileNumber=0;
+
+    $fileNumber=-1;
     if ($parseContext['currentFile']=="") {
-        $currentFile="{$directory}blk00000.dat";
+        $fileNumber=0;
+        $currentFile=$blockFiles[$fileNumber];
         $offset=0;
     } else {
         $currentFile=$parseContext['currentFile'];
         $offset=$parseContext['offset'];
+        for ($i=0;$i<count($blockFiles);$i++){
+            if ($blockFiles[$i]==$currentFile) {$fileNumber=$i;break;}
+        }
     }
+    if ($fileNumber==-1){T("Strange 'currentFile' in parsecontext\n");die();}
+                           
     $handle = fopen($currentFile, 'rb');
     while (true) {                            // 'yields' after every block encountered
         while (true) {                        // In the blk*.dat file-stream fork-blocks occur and can be skipped
@@ -423,33 +439,31 @@ function extractBlocksFromStream(string $directory): Generator {
             ];
         }
 
-        // Determine next file by incrementing the current index
-        if (preg_match('/blk(\d+)\.dat$/', basename($currentFile), $m)) {
-            $num      = intval($m[1]);
-            $nextNum  = $num + 1;
-            $nextName = sprintf('blk%05d.dat', $nextNum);
-            $nextFile = "$directory/$nextName";
-
+        // See if there is a next file, otherwise turn to RPC
+        if (($fileNumber+1)<count($blockFiles)) {
+            $nextFile = $blockFiles[$fileNumber+1];
             if (file_exists($nextFile)) {
                 // Close and switch to the new file
                 fclose($handle);
+                $fileNumber++;
                 $currentFile = $nextFile;
-                $fileNumber  = 1*substr($currentFile,$fileNrPos,5);
                 $handle      = fopen($currentFile, 'rb');
                 if (!$handle) {
                     throw new \RuntimeException("Unable to open next file $currentFile");
                 }
                 $offset      = 0;
                 continue;
+            } else {
+                if ($raceToTheTop) {$raceToTheTop=false;}
             }
-        }
+        } else {$raceToTheTop=false;}
         
         // No news from blockchain;
         if ($tipReached){
             $serviceTime=microtime(true);
             handleClientRequests();
             $serviceTime=microtime(true)-$serviceTime;
-            if ((1_000_000 - $serviceTime)>0) {usleep(1_000_000 - $serviceTime);}
+            if ((1000000 - $serviceTime)>0) {usleep(1000000 - $serviceTime);}
         } else {
             sleep(1);
         }
@@ -553,11 +567,11 @@ class BlockIndex { /* loads all blockhashes through RPC;
    Use it to serialize blocks in blk*.dat (which are not serialized)
    Buffer previously loaded hashes in file blockhashes
 */
-    public array $hashMap = [];
-    public int $tip;
-    public int $maxReorgDepth=100;
-    public int $backupHeight;
-    private int $batchSize=500;
+    public $hashMap = [];
+    public $tip;
+    public $maxReorgDepth=100;
+    public $backupHeight;
+    private $batchSize=500;
     
     public function __construct() {
         L("Test if blockchain is synced...");
@@ -587,9 +601,10 @@ class BlockIndex { /* loads all blockhashes through RPC;
         $fetched = '';
         $height = $start;
         L("Loading block hashes (batch size: $batchSize) ...");
-        $end = null;    
+        $end = null;
+        $round=0;$rounds=round(100000/$batchSize);
         while (true) {
-            if ($end !== null && $height > $end) break;    
+            if ($end !== null && $height > $end) break;
             $count = ($end !== null && ($end - $height + 1) < $batchSize) ? ($end - $height + 1) : $batchSize;
             $batch = [];
             for ($i = $height; $i < $height + $count; $i++) {
@@ -602,8 +617,10 @@ class BlockIndex { /* loads all blockhashes through RPC;
                     return $fetched; // likely done
                 }
                 $fetched .= $result . "\n";
-            }    
+            }
             $height += $count;
+            $round++;
+            echo("\rLoading block hashes (batch size: $batchSize) ... $height");
         }
         L("\n");
         return $fetched;
@@ -669,6 +686,7 @@ class BlockParser { /* Unravels a binary block */
         ];
     }
     private function parseTransactionLite(string $buffer, int $offset): array {
+        global $height,$tikker;
         /* Ring-of-trust-only parser
            Marks a transaction as relevant when it must be indexed; skips coinbase and tx that don't have P2PKH outputs
         */
@@ -677,6 +695,8 @@ class BlockParser { /* Unravels a binary block */
         // 1. Version (4 bytes)
         $version = substr($buffer, $offset, 4);
         $offset += 4;
+        
+        if ($tikker=="DEM") {$offset += 4;} //nTime
     
         // 2. Detect SegWit Marker/Flag (peek)
         $marker = ord($buffer[$offset] ?? "\x00");
@@ -697,6 +717,10 @@ class BlockParser { /* Unravels a binary block */
         $vinStart=$offset;
         $inputs=[];
         for ($i = 0; $i < $vinCount; $i++) {
+            if ($offset>strlen($buffer)){
+                die ("break at $height\n");
+            }
+            
             $inputs[]=$this->parseInput($buffer, $offset);
         }
     
@@ -729,6 +753,12 @@ class BlockParser { /* Unravels a binary block */
         // 7. Locktime (4 bytes)
         $locktime = substr($buffer, $offset, 4);
         $offset += 4;
+        
+        // 8. Other stuff
+        if ($tikker=="DEM"){
+            $commentLength = $this->readVarInt($buffer, $offset);
+            $offset += $commentLength;
+        }
 
         $isRelevant=true;
         if ($isCoinbase){
@@ -1058,13 +1088,13 @@ function base58_encode(string $bin): string {
 }
 
 class JsonRpcClient {
-    private string $url;
-    private int $id = 0;
+    private $url;
+    private $id = 0;
 
     public function __construct(array $rpc) {
         $this->url = "http://{$rpc['user']}:{$rpc['pass']}@{$rpc['host']}:{$rpc['port']}/";
     }
-    public function call(string $method, array $params = []): mixed {
+    public function call( $method, $params = []) {
         $payload = $this->makePayload($method, $params);
         $response = $this->sendRequest($payload);
         return $this->handleResponse($response, $payload['id']);
@@ -1098,7 +1128,8 @@ class JsonRpcClient {
             'params'  => $params,
         ];
     }
-    private function sendRequest(array|string $payload): array {
+    
+    private function sendRequest($payload) {
         $ch = curl_init($this->url);
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true,
@@ -1117,7 +1148,7 @@ class JsonRpcClient {
         }
         return $decoded;
     }
-    private function handleResponse(array $response, int $expectedId): mixed {
+    private function handleResponse(array $response, int $expectedId) {
         if (isset($response['error']) && $response['error'] !== null) {
             throw new \Exception('RPC error: ' . json_encode($response['error']));
         }
@@ -1163,7 +1194,7 @@ function store_hash_index(&$table){
         file_put_contents($table['name']."_bucket",shmop_read($table['bucket'][P],$i,$size),$append);
     }
 }
-function dump_index(&$table,$part,$where){
+function dump_index(&$table,$part,$where=""){
     if ($where=="") {$where=$table['name']."_$part";};
     $step=10000000; // 10MB ok?
     for ($i=0;$i<$table[$part][SIZE];$i+=$step) {
@@ -1172,7 +1203,7 @@ function dump_index(&$table,$part,$where){
         file_put_contents($where,shmop_read($table[$part][P],$i,$size),$append);
     }
 }
-function load_index(&$table,$part,$where){
+function load_index(&$table,$part,$where=""){
     if ($where=="") {$where=$table['name']."_$part";};
     $step=10000000; // 10MB ok?
     $fp = fopen($where, "rb");
