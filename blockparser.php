@@ -19,8 +19,8 @@
            - PUB-TXOs are linked through linked list; Maintain last TXO for fast addition
 
   [index](size)    
-  TX_table-bucket(44):  [0]txid(32) + [1]blocknr/lastchange(4) + [2]txo-pointer(4) + [3]collistion-linked-list(4)
-  PUB_table-bucket(36): [0]scripthash(20) + [1]blocknr/lastchange(4) + [2]first txo(4) + [3]last txo(4) + [4]collistion-linked-list(4)
+  TX_table-bucket(44):  [0]txid(32) + [1]blocknr/lastchange(4) + [2]txo-pointer(4) + [3]collision-linked-list(4)
+  PUB_table-bucket(36): [0]scripthash(20) + [1]blocknr/lastchange(4) + [2]first txo(4) + [3]last txo(4) + [4]collision-linked-list(4)
   TXO_table_bucket(28): [0]txin(4) + [1]nout(4) + [2]value(8) + [3]scripthash(4) + [4]txout/spend(4) + [5]scripthash-linkedlist(4) 
   
   +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -56,7 +56,10 @@ L("==== Start ".now()." ====\n\n");
 @unlink("TXidx");
 @unlink("BLKidx");
 
-list($tikker,$user,$ww,$port,$datadir)=explode("|",trim(file_get_contents(ROOT."buildchain.conf")));
+list($tikker,$user,$ww,$port,$datadir)=explode("|",trim(file_get_contents(ROOT."rot.conf")));
+$tikker=strtoupper($tikker);
+$versions["LTC"]=48;$versions["BTC"]=0x00;$versions["CDN"]=28;$versions["DEM"]=53;$versions["EFL"]=48;$versions["AUR"]=23;$versions["PAK"]=0x00;$versions["SLG"]=0x00;$versions["RUBTC"]=0x00;$versions["FJC"]=0x00;$versions["BOLI"]=0x00;$versions["CESC"]=0x00;
+$version=$versions[$tikker];
 
 if (substr($datadir,-1)!="/") {$datadir.="/";}
 if (file_exists("{$datadir}blocks")) {$datadir.="blocks/";}
@@ -102,7 +105,7 @@ $TXidx="";$TXdata="";$TX_sum=0;$BLKidx="";
 
 $recovery=false;
 if (file_exists(ROOT."AUX")){ // Recover...
-    $parseContext=json_decode(file_get_contents("AUX"),true);
+    $parseContext=unserialize(file_get_contents("AUX"));
     $hash = $RPC->call('getblockhash', [$parseContext['height']]);
     if ($hash==$parseContext['hash']) { 
         L("Recovering ...");
@@ -188,7 +191,6 @@ if (!$recovery){
 }
 
 $parser = new BlockParser();
-$tipTarget=count($BLOCKINDEX->hashMap);
 L("Race to the top ...\n");
 foreach (extractBlocksFromStream() as $entry) {
     /* Two situations are inter-twined:
@@ -198,6 +200,7 @@ foreach (extractBlocksFromStream() as $entry) {
                            Just see if it convenes with the old truth, otherwise rewind.
     */
     if ($raceStatus!=$raceToTheTop){
+        L("Top reached at height ".($height-1)."\n");
         if (!$fullBackup) {
             backup(true);
             $fullBackup=true;
@@ -256,15 +259,15 @@ foreach (extractBlocksFromStream() as $entry) {
         $parsed = $parser->getBlock($entry['raw']);
         $skipped+=$parsed['skipped'];
         $relevant+=count($parsed['transactions']);
-        if (!$fullBackup){ 
+        if (!$fullBackup){
             $TXidx.=pack('Vv',$TX_sum,count($parsed['transactions']));  // All relevant tx's per block (can be 0)
-            $BLKidx.=pack('vV',$entry['fileNumber'],$entry['offset']); // pointer to block in blk*.dat (to avoid rpc getrawtransaction/txindex=1)
+            $BLKidx.=pack('vV',$entry['fileNumber'],$entry['offset']);  // pointer to block in blk*.dat (to avoid rpc getrawtransaction/txindex=1)
         }
         foreach ($parsed['transactions'] as $tx){
             $txID=hashtable_add_TX($TX_table,[hex2bin($tx['txid']),$height,$TXO_table['bucket'][TOP]+1,0]);
             foreach ($tx['outputs'] as $output) {
                 // output(32): [0]n(4) [1]value/amount(8) [2]pubkeyhash(20)
-                // pub(36):    [0]scripthash(20) [1]blocknr/lastchange(4) [2]first-txo(4) [3]last-txo(4) [4]next hash%-collistion(4)
+                // pub(36):    [0]scripthash(20) [1]blocknr/lastchange(4) [2]first-txo(4) [3]last-txo(4) [4]next hash%-collision(4)
                 $next_txoID=$TXO_table['bucket'][TOP]+1; //
                 [$pubID,$previous_last_txo]=hashtable_add_PUB($PUB_table,[$output[2],$height,$next_txoID,$next_txoID,0]);
 
@@ -273,7 +276,7 @@ foreach (extractBlocksFromStream() as $entry) {
                 if ($previous_last_txo!=$txoID) { //correct linked list
                     $content=hashtable_read($TXO_table['bucket'],$previous_last_txo);
                     $content[5]=$txoID;
-                    hashtable_write($TXO_table['bucket'],$previous_last_txo,$content);
+                    hashtable_write($TXO_table['bucket'],$previous_last_txo,$content);  // All outputs to a scrypthash are inter-linked
                 }
             }
 
@@ -282,7 +285,7 @@ foreach (extractBlocksFromStream() as $entry) {
                     $prev_tx=strrev($input[0]);$prev_vout=$input[1];
                     [$index,$record]=find($TX_table,$prev_tx);
                     if ($index!==false){
-                        // [0]txid(32) + [1]blocknr/lastchange(4) + [2]txo-pointer(4) + [3]next-hash-collistion(4)
+                        // [0]txid(32) + [1]blocknr/lastchange(4) + [2]txo-pointer(4) + [3]next-hash-collision(4)
                         // txo[0]:9 txo[1]:0 txo[2]:2500000000 txo[3]:12 txo[4]:0 txo[5]:0
                         // [0]txin(4) - [1]nout(4) - [2]value(8) - [3]scripthash(4) - [4]txout/spend(4) - [5]next scripthash occurence(4) 
                         $txo=hashtable_read($TXO_table['bucket'],$record[2]);
@@ -339,7 +342,7 @@ function computeBlockHash(string $header80): string {
  *
  */
 function extractBlocksFromStream(): Generator {
-    global $RPC,$BLOCKINDEX,$raceToTheTop,$orphan,$blkvalid,$parseContext,$fullBackup,$height,$blockFiles;
+    global $RPC,$BLOCKINDEX,$raceToTheTop,$orphan,$blkvalid,$parseContext,$fullBackup,$height,$blockFiles,$tikker;
     
     $coreFailure=false;
     $pollDelayMicro = 500000; // 0.1s; Poll delay when waiting for new data
@@ -358,7 +361,7 @@ function extractBlocksFromStream(): Generator {
             if ($blockFiles[$i]==$currentFile) {$fileNumber=$i;break;}
         }
     }
-    if ($fileNumber==-1){T("Strange 'currentFile' in parsecontext\n");die();}
+    if ($fileNumber==-1){L("Strange 'currentFile' {$currentFile} in parsecontext\n");die();}
                            
     $handle = fopen($currentFile, 'rb');
     while (true) {                            // 'yields' after every block encountered
@@ -375,12 +378,12 @@ function extractBlocksFromStream(): Generator {
                 if ($magic !== MAGIC) { // check magic bytes (if zero's instead, switch to RPC retrieval)
                     if (bin2hex($magic) === str_repeat('00', 4)) {
                         $raceToTheTop=false;
-                        L("End of disk blockstream reached at height ".($height-1)."; Turn to RPC; Waiting for next block ... \n");
+                        L("End of disk blockstream reached at height ".($height-1)."; Turn to RPC; Waiting for next block and client requests... \n");
                         continue; // turn to RPC
                     }
                     throw new \Exception("Invalid magic bytes at offset $offset in file $currentFile: " . bin2hex($magic));
                 }            
-    
+
                 $blockData = fread($handle, $blockLength); // Attempt to read the full block
                 if (strlen($blockData) < $blockLength) {
                     throw new Exception("Incomplete block at offset $offset in file $file");
@@ -402,13 +405,18 @@ function extractBlocksFromStream(): Generator {
                     $blockHash     = $RPC->call('getblockhash',[$height]);
                     $rawHex        = $RPC->call('getblock',[$blockHash, false]);
                     $newHeight     = $height;
-                    $blockData     = hex2bin($rawHex);
-                    $blockLength   = strlen($blockData);
-                    $prevBlockHash = bin2hex(strrev(substr($blockData, 4, 32)));
+                    if ($tikker=="DEM") {
+                        $blockData     = $rawHex;
+                        $prevBlockHash = $rawHex['previousblockhash'];
+                    } else {
+                        $blockData     = hex2bin($rawHex);
+                        $blockLength   = strlen($blockData);
+                        $prevBlockHash = bin2hex(strrev(substr($blockData, 4, 32)));
+                    }
                     if (!$tipReached) {
                         if ($height>=$top) {
                             $top=$RPC->call('getblockcount',[]);
-                            if ($height==$top) {$tipReached=true;}
+                            if ($height-1==$top) {$tipReached=true;} // height is the next block we are waiting for
                         }
                     }
                 } catch (\GuzzleHttp\Exception\ConnectException $e) {
@@ -421,8 +429,9 @@ function extractBlocksFromStream(): Generator {
                 } catch (Exception $e) { // Not available yet
                     $coreFailure=false;
                     if (strpos($e->getMessage(),'"code":-8')===false) {
+                    if (strpos($e->getMessage(),'"code":-1')===false) {
                         L('Caught exception: '.$e->getMessage()."\n");
-                    }
+                    }}
                     sleep(1);
                     break;
                 }
@@ -430,7 +439,7 @@ function extractBlocksFromStream(): Generator {
             }
             yield [
                 'raw'         => $blockData,
-                'offset'      => $offset,
+                'offset'      => $parseContext['offset'],
                 'fileNumber'  => $fileNumber,
                 'length'      => $blockLength,
                 'hash'        => $blockHash,
@@ -459,14 +468,11 @@ function extractBlocksFromStream(): Generator {
         } else {$raceToTheTop=false;}
         
         // No news from blockchain;
-        if ($tipReached){
-            $serviceTime=microtime(true);
-            handleClientRequests();
-            $serviceTime=microtime(true)-$serviceTime;
-            if ((1000000 - $serviceTime)>0) {usleep(1000000 - $serviceTime);}
-        } else {
-            sleep(1);
-        }
+        $serviceTime=microtime(true);
+        handleClientRequests();
+        $serviceTime=microtime(true)-$serviceTime;
+        if ((1000000 - $serviceTime)>0) {usleep(1000000 - $serviceTime);}
+        
     }
 }
 function backup($full=false){
@@ -484,19 +490,19 @@ function backup($full=false){
         if ($date_1>$date_2) {$postfix="_backup_2";} else {$postfix="_backup_1";}
         L("Backup $postfix at height {$parseContext['height']}: ");
         
-        file_put_contents("TX_aux$postfix",json_encode($TX_table));
-        file_put_contents("PUB_aux$postfix",json_encode($PUB_table));
-        file_put_contents("TXO_aux$postfix",json_encode($TXO_table));
-        file_put_contents("$postfix",json_encode($parseContext));
+        file_put_contents("TX_aux$postfix",serialize($TX_table));
+        file_put_contents("PUB_aux$postfix",serialize($PUB_table));
+        file_put_contents("TXO_aux$postfix",serialize($TXO_table));
+        file_put_contents("$postfix",serialize($parseContext));
         
         dump_index($TX_table,"hash","TX_hash$postfix");
         dump_index($PUB_table,"hash","PUB_hash$postfix");
     } else {
         L("Backup Full at height {$parseContext['height']}: ");
-        file_put_contents("AUX",json_encode($parseContext));
-        file_put_contents("TX_aux",json_encode($TX_table));
-        file_put_contents("PUB_aux",json_encode($PUB_table));
-        file_put_contents("TXO_aux",json_encode($TXO_table));
+        file_put_contents("AUX",serialize($parseContext));
+        file_put_contents("TX_aux",serialize($TX_table));
+        file_put_contents("PUB_aux",serialize($PUB_table));
+        file_put_contents("TXO_aux",serialize($TXO_table));
         dump_index($TX_table,"hash","TX_hash");
         dump_index($PUB_table,"hash","PUB_hash");
         dump_index($TX_table,"bucket","TX_bucket");
@@ -510,16 +516,21 @@ function recover($full=false) { // Rewinds to a valid backup-tip
     $time=microtime(true);
 
     if ($full) {
-        $parseContext=json_decode(file_get_contents("AUX"),1);
+        $parseContext=unserialize(file_get_contents("AUX"));
         L("Recover Full till height ".$parseContext['height']."\n");
-        $TX_table=json_decode(file_get_contents(ROOT."TX_aux"),1);
-        $PUB_table=json_decode(file_get_contents(ROOT."PUB_aux"),1);
-        $TXO_table=json_decode(file_get_contents(ROOT."TXO_aux"),1);
+        $TX_table=unserialize(file_get_contents(ROOT."TX_aux"));
+        $PUB_table=unserialize(file_get_contents(ROOT."PUB_aux"));
+        $TXO_table=unserialize(file_get_contents(ROOT."TXO_aux"));
         hashtable_initialize($TX_table['hash']);
         hashtable_initialize($TX_table['bucket']);
         hashtable_initialize($PUB_table['hash']);
         hashtable_initialize($PUB_table['bucket']);
         hashtable_initialize($TXO_table['bucket']);    
+        load_index($TX_table,'hash',"TX_hash");
+        load_index($PUB_table,'hash',"PUB_hash");
+        load_index($TX_table,'bucket',"TX_bucket");
+        load_index($PUB_table,'bucket',"PUB_bucket");
+        load_index($TXO_table,'bucket',"TXO_bucket");
     } else {
         // Test youngest
         if (file_exists("_backup_1")) {$date_1=filemtime("_backup_1");} else {$date_1=0;}
@@ -527,7 +538,7 @@ function recover($full=false) { // Rewinds to a valid backup-tip
         if ($date_1>$date_2) {$postfix="_backup_2";} else {$postfix="_backup_1";}
         L("Recover $postfix at height {$parseContext['height']}\n");
     
-        $parseContext=json_decode(file_get_contents($postfix),1);
+        $parseContext=unserialize(file_get_contents($postfix));
         $hash = $RPC->call('getblockhash', [$parseContext['height']]);
         if ($hash!=$parseContext['hash']) { // rewind beyond $maxReorgDepth
             if ($postfix=="_backup_1") {$postfix="_backup_2";} else {$postfix="_backup_1";}
@@ -543,24 +554,299 @@ function recover($full=false) { // Rewinds to a valid backup-tip
         $PUB_table_old = unserialize(serialize($PUB_table));
     
         // get the index states at the moment of backup
-        $TX_table=json_decode(file_get_contents("TX_aux$postfix"),1);
-        $PUB_table=json_decode(file_get_contents("PUB_aux$postfix"),1);
+        $TX_table=unserialize(file_get_contents("TX_aux$postfix"));
+        $PUB_table=unserialize(file_get_contents("PUB_aux$postfix"));
         $TX_table['hash'][KEY]=$TX_table_old['hash'][KEY]; // Recover shmop contexts
         $PUB_table['hash'][KEY]=$PUB_table_old['hash'][KEY];
         $TX_table['hash'][P]=$TX_table_old['hash'][P];
         $PUB_table['hash'][P]=$PUB_table_old['hash'][P];
 
         // Reload hash-tables
-        load_index($TX_hash,'hash',"TX_hash$postfix");
-        load_index($PUB_hash,'hash',"PUB_hash$postfix");
-        trunc_bucket($TX_hash);
-        trunc_bucket($PUB_hash);
-        trunc_bucket($TXO_hash);
+        load_index($TX_table,'hash',"TX_hash$postfix");
+        load_index($PUB_table,'hash',"PUB_hash$postfix");
+        trunc_bucket($TX_table);
+        trunc_bucket($PUB_table);
+        trunc_bucket($TXO_table);
         L("rewind to height {$parseContext['height']}: \n");
     }
 }
 function handleClientRequests() {
-    // stub
+    global $height,$TX_table,$TXO_table,$PUB_table,$version;
+    $requests=glob(Q."/*");
+    foreach($requests as $request){
+        $destination=str_replace(Q,A,$request);
+	$output="Request error: $request\n";
+        $cmd=file($request,FILE_IGNORE_NEW_LINES);
+        $file=basename($request);
+        @list($a,$b)=explode(":",$cmd[0]);
+        $a=strtolower($a);
+        $start=microtime(true);
+        if ($a=="blk") {
+            findBlok($b);
+            echo "(".(microtime(true)-$start).")\n";
+        } elseif ($a=="testrich"){
+            /* retrieve by (chrome)
+               right-click "rank 1" + inspect
+               right-click "<tbody> + copy INNERhtml
+               paste this as A."/rich.dat"
+               - Remember: coinbase transactions (mined inputs) and non-legacy outputs (non-PSPKH) are not indexed
+               - The forth column is the pubtable index; retrieve it by sending the request pubtable:index
+            */
+            $html=file_get_contents(A."/rich.dat");
+            $dom = new DOMDocument();
+            libxml_use_internal_errors(true); // Suppress warnings for invalid HTML
+            $dom->loadHTML($html);
+            libxml_clear_errors();
+            $rows = $dom->getElementsByTagName('tr');
+            foreach ($rows as $row) {
+                $cells = $row->getElementsByTagName('td');
+                if ($cells->length >= 5) {
+                    $col1 = trim($cells->item(0)->textContent); 
+                    $col2 = trim($cells->item(1)->textContent); 
+                    $col3 = trim($cells->item(2)->textContent); 
+                    $rich[]="$col1 | $col2 | $col3\n";
+                }
+            }
+
+            $n=$PUB_table['bucket'][TOP];
+            for ($i=1;$i<=$n;$i++){
+                $record=hashtable_read($PUB_table['bucket'],$i);
+                $short=substr(address_from_pubkeyhash($record[0]),0,8);
+                $pubs[$short]=$i;
+                file_put_contents(A."/short",$short."\n",FILE_APPEND);
+                if (($i%10000)==0) {echo "$i\n";}
+            }
+            foreach ($rich as $line) {
+                $item=explode("|",trim($line));
+                if (count($item)==3){
+                    $pub=substr(trim($item[1]),0,8);
+                    $sum=0;
+                    if (isset($pubs[$pub])) {
+                        $record=hashtable_read($PUB_table['bucket'],$pubs[$pub]);
+                        $txo=hashtable_read($TXO_table['bucket'],$record[2]);
+                        while ($txo[3]==$pubs[$pub]){
+                            if ($txo[4]==0) {$sum+=$txo[2];}
+                            if ($txo[5]!=0){
+                                $txo=hashtable_read($TXO_table['bucket'],$txo[5]);
+                            } else {
+                                $txo[3]=0;
+                            }
+                        }
+                        echo trim($line)." | {$pubs[$pub]} | $sum\n";
+                    } else { 
+                        echo trim($line)." | ?\n";
+                    }
+                }
+            }            
+        } elseif ($a=="tx"){
+            [$index,$record]=find($TX_table,hex2bin($b));
+            if ($index){
+                echo "\n{$cmd[0]}";
+                echo "index:$index\n";
+                echo "txId:".bin2hex($record[0])."\n";
+                echo "block:{$record[1]}\n";
+                echo "txo-pointer:{$record[2]}\n";
+                echo "collision:{$record[3]}\n";
+                $txo=hashtable_read($TXO_table['bucket'],$record[2]);
+                $i=0;
+                while ($txo[0]==$index) {
+                    $pub=hashtable_read($PUB_table['bucket'],$txo[3]);
+                    $base58=address_from_pubkeyhash($pub[0]);
+                    echo "n:{$txo[1]} value:{$txo[2]} pub:$base58 spend:{$txo[4]} linked-list:{$txo[5]}\n";
+                    $i++;
+                    $txo=hashtable_read($TXO_table['bucket'],$record[2]+$i);                    
+                }
+            }
+            echo "(".(microtime(true)-$start).")\n\n";            
+        } elseif ($a=="pub"){
+  //TX_table-bucket(44):  [0]txid(32) + [1]blocknr/lastchange(4) + [2]txo-pointer(4) + [3]collision-linked-list(4)
+  //PUB_table-bucket(36): [0]scripthash(20) + [1]blocknr/lastchange(4) + [2]first txo(4) + [3]last txo(4) + [4]collision-linked-list(4)
+  //TXO_table_bucket(28): [0]txin(4) + [1]nout(4) + [2]value(8) + [3]scripthash(4) + [4]txout/spend(4) + [5]scripthash-linkedlist(4) 
+            
+            $payload=base58check_decode($b);
+            if ($payload) {
+                $pubkeyhash=substr($payload,1);
+                [$index,$record]=find($PUB_table,$pubkeyhash);
+                if ($record[0]==$pubkeyhash) {
+                    echo "\n{$cmd[0]}";
+                    echo "\nversion:$version\n";
+                    echo "\npkhash:".bin2hex($record[0]);
+                    echo "\nblocknr/Lastchange:".$record[1];
+                    echo "\nfirst txo:".$record[2];
+                    echo "\nlast txo:".$record[3];
+                    $txo=hashtable_read($TXO_table['bucket'],$record[2]);
+                    $sum=0;$n=0;
+                    while ($txo[3]==$index){
+                        $n++;
+                        if ($txo[4]==0) {
+                            $tx=hashtable_read($TX_table['bucket'],$txo[0]);
+                            echo "\n".bin2hex($tx[0]).":".$txo[1].":".$txo[2];
+                            $sum+=$txo[2];
+                        }
+                        if ($txo[5]!=0){
+                            $txo=hashtable_read($TXO_table['bucket'],$txo[5]);
+                        } else {
+                            $txo[3]=0;
+                        }
+                    }                    
+                    echo "\ntxo total:$n";                            
+                    echo "\nbalance:$sum\n";
+                }
+            }
+            echo "(".(microtime(true)-$start).")\n\n";
+        } elseif ($a=="puball"){
+            $payload=base58check_decode($b);
+            if ($payload) {
+                $pubkeyhash=substr($payload,1);
+                [$index,$record]=find($PUB_table,$pubkeyhash);
+                if ($record[0]==$pubkeyhash) {
+                    echo "\n{$cmd[0]}";
+                    echo "\npkhash:".bin2hex($record[0]);
+                    echo "\nblocknr/Lastchange:".$record[1];
+                    echo "\nfirst txo:".$record[2];
+                    echo "\nlast txo:".$record[3];
+                    $txo=hashtable_read($TXO_table['bucket'],$record[2]);
+                    $sum=0;$sum_in=0;$sum_out=0;$n=0;$n_in=0;$n_out=0;
+                    while ($txo[3]==$index){
+                        $n++;
+                        $sum+=$txo[2];
+                        if ($txo[4]==0) {
+                            $tx=hashtable_read($TX_table['bucket'],$txo[0]);
+                            echo "\n".$n.":".bin2hex($tx[0]).":".$txo[1].":".$txo[2];
+                            $sum_in+=$txo[2];
+                            $n_in++;
+                        }else{
+                            $tx=hashtable_read($TX_table['bucket'],$txo[4]);
+                            echo "\n".$n.":".bin2hex($tx[0]).":".$txo[1].":".$txo[2];
+                            $sum_out+=$txo[2];
+                            $n_out++;
+                        }
+                        if ($txo[5]!=0){
+                            $txo=hashtable_read($TXO_table['bucket'],$txo[5]);
+                        } else {
+                            $txo[3]=0;
+                        }
+                    }                    
+                    echo "\ntxo total:$n spend:$n_out rest:$n_in";
+                    echo "\nInput:$sum spend:$sum_out rest:$sum_in\n";
+                }
+            }
+            echo "(".(microtime(true)-$start).")\n\n";
+        } elseif ($a=="blkblunt") {
+            echo "\n{$cmd[0]}";
+            $n=$TX_table['bucket'][TOP];
+            $found=false;
+            for ($i=1;$i<=$n;$i++){
+                $record=hashtable_read($TX_table['bucket'],$i);
+                if ($record[1]==$b) {
+                    echo bin2hex($record[0])."\n";
+                    $found=true;
+                } else {
+                    if ($found) {break;}
+                }
+            }
+            echo "(".(microtime(true)-$start).")\n\n";
+        } elseif ($a=="txtable") {
+            echo "\n{$cmd[0]}";
+            if ($b==""){print_r($TX_table);
+            }elseif ($b=="performance") {
+                $n=$TX_table['bucket'][TOP];
+                for ($i=1;$i<=$n;$i++){$record=hashtable_read($TX_table['bucket'],$i);}
+            }elseif (is_numeric($b)) {
+                $record = hashtable_read($TX_table['bucket'],$b);
+                print_r($record);
+                echo bin2hex($record[0])."\n";
+            }
+            echo "(".(microtime(true)-$start).")\n\n";
+        } elseif ($a=="txotable") {
+            echo "\n{$cmd[0]}";
+            if ($b==""){print_r($TXO_table);
+            }elseif ($b=="performance") {
+                $n=$TXO_table['bucket'][TOP];
+                for ($i=1;$i<=$n;$i++){$record=hashtable_read($TXO_table['bucket'],$i);}
+            }elseif (is_numeric($b)) {
+                $record = hashtable_read($TXO_table['bucket'],$b);
+                print_r($record);
+            }
+            echo "(".(microtime(true)-$start).")\n\n";
+        } elseif ($a=="pubtable") {
+            echo "\n{$cmd[0]}";
+            if ($b==""){print_r($PUB_table);
+            }elseif ($b=="performance") {
+                $n=$PUB_table['bucket'][TOP];
+                for ($i=1;$i<=$n;$i++){$record=hashtable_read($PUB_table['bucket'],$i);}
+            }elseif (is_numeric($b)) {
+                $record = hashtable_read($PUB_table['bucket'],$b);
+                echo "scripthash:".bin2hex($record[0])."\n";
+                echo "base58:".address_from_pubkeyhash($record[0])."\n";
+                echo "blocknr last change:{$record[1]}\n";
+                echo "first txo:{$record[2]}\n";
+                echo "last txo:{$record[3]}\n";
+                echo "collision:{$record[4]}\n";
+            }
+            echo "(".(microtime(true)-$start).")\n\n";
+        }elseif ($a=="stop") {
+            echo "\n{$cmd[0]}";
+            unlink("$request");
+	    die("\n");
+        }
+        if (file_exists($destination)) {@unlink($request);} else {rename($request,$destination);}        
+    }    
+}
+function findBlok($block) {
+    global $TX_table,$height;
+    $start=microtime(true);$iterations=0;
+    $i=0;
+    $n=$TX_table['bucket'][TOP];
+    $record1 = hashtable_read($TX_table['bucket'],1);
+echo "1:{$record1[1]};";
+    $record2 = hashtable_read($TX_table['bucket'],$n);
+echo "$n:{$record2[1]};";
+    $diff=$record2[1]-$record1[1];
+    $step=$diff/$n;
+    $direction=1;
+    $last=$record1;
+    $absent=false;
+    while ($diff!=0) {
+        $iterations++;
+        $i = max(1, min($n, $i + $direction * floor($block * $step)));
+
+        $record = hashtable_read($TX_table['bucket'],$i);
+echo "$i:{$record[1]}";
+        $diff=$record[1]-$block;
+        if ($diff!=0) {
+            if ($step==1) {
+                if ($direction==1) {
+                    if ($record[1]>$block) {$absent=true;break;} // block absent
+                } else {
+                    if ($record[1]<$block) {$absent=true;break;} // block absent
+                }
+            }
+            if ($diff<0) {
+                $direction=1;
+            } else {
+                $direction=-1;
+                if ($step>1) {$step--;}
+            }
+        } 
+        $last=$record[1];
+        if ($iterations>200) {break;}
+    }
+    if (!$absent) {
+        do {
+            $i--;
+            $record = hashtable_read($TX_table['bucket'],$i);
+        } while ($record[1]!=$block);
+        do {
+            $i++;
+            $record = hashtable_read($TX_table['bucket'],$i);
+            if ($record[1]==$block) $tx[]=bin2hex($record[0]);
+        } while ($record[1]==$block);
+        echo (microtime(true)-$start).":$iterations\n";
+        print_r($tx); // <------------- rubbish
+    } else {
+        echo (microtime(true)-$start).":$iterations\nBlock has no relevant transactions; close:$last\n";
+    }
 }
 
 class BlockIndex { /* loads all blockhashes through RPC;
@@ -592,9 +878,9 @@ class BlockIndex { /* loads all blockhashes through RPC;
         file_put_contents("blockhashes",$fetched,FILE_APPEND);
         $blockhashes=explode("\n",$fetched);
         for ($i=0; $i<count($blockhashes); $i++){$this->hashMap[$blockhashes[$i]]=$i+$start;}
-        $this->tip=count($blockhashes)+$start;
+        $this->tip=count($blockhashes)+$start-2;
         $this->backupHeight=$this->tip-$this->maxReorgDepth;
-        L(count($blockhashes)." new blocks; New tip: {$this->tip}\n");
+        L(count($blockhashes)." new blocks; Latest: {$this->tip}\n");
     }
     private function fetchBlockhashesFromRpc(int $start, int $batchSize): string {
         global $RPC;
@@ -611,18 +897,20 @@ class BlockIndex { /* loads all blockhashes through RPC;
                 $batch[] = ['getblockhash', [$i]];
             }
             $results = $RPC->batch($batch);
+            $i=0;
             foreach ($results as $id => $result) {
                 if ($result instanceof \Exception) {
-                    L("\n");    
+                    L(" .".($height+$i)."\n");    
                     return $fetched; // likely done
                 }
                 $fetched .= $result . "\n";
+                $i++;
             }
             $height += $count;
             $round++;
             echo("\rLoading block hashes (batch size: $batchSize) ... $height");
         }
-        L("\n");
+        L(" $height\n");
         return $fetched;
     }
     private function awaitSync(): void {        
@@ -639,45 +927,55 @@ class BlockIndex { /* loads all blockhashes through RPC;
 }
 
 class BlockParser { /* Unravels a binary block */
-    public function getBlock(string $buffer): array {
-        global $height;
-        $offset = 0;
-        $version = unpack("V", substr($buffer, $offset, 4))[1];
-        $offset += 4;    
-        $prevBlock = strrev(substr($buffer, $offset, 32));
-        $offset += 32;
-        $merkleRoot = strrev(substr($buffer, $offset, 32));
-        $offset += 32;
-        $timestamp = unpack("V", substr($buffer, $offset, 4))[1];
-        $offset += 4;
-        $bits = unpack("V", substr($buffer, $offset, 4))[1];
-        $offset += 4;
-        $nonce = unpack("V", substr($buffer, $offset, 4))[1];
-        $offset += 4;
-        $header = [
-            'version' => $version,
-            'prevBlock' => bin2hex($prevBlock),
-            'merkleRoot' => bin2hex($merkleRoot),
-            'timestamp' => $timestamp,
-            'bits' => $bits,
-            'nonce' => $nonce
-        ];
-        $offset = 80; // Skip block header just for clarity
-        if ($version & (1 << 8)) {$this->skipAuxPowHeader($buffer, $offset);}
-        
-        $txCountSize = 0;
-        $txCount = $this->parseVarInt($buffer, $offset, $txCountSize);
-        $offset += $txCountSize;    
+    public function getBlock($buffer): array {
+        global $height,$RPC;
+        $skipped=0;        
         $transactions = [];
-        $skipped=0;
-        for ($i = 0; $i < $txCount; $i++) {
-            $tx = $this->parseTransactionLite($buffer, $offset);
+        if (is_array ($buffer)) { // decoded json
+            $txCount=count($buffer['tx']);
+            for ($i = 0; $i < $txCount; $i++) {
+                $txid=$buffer['tx'][$i];
+                $txBin=hex2bin($RPC->call('getrawtransaction', [$txid, 0]));
+                $offset=0;
+                $tx = $this->parseTransactionLite($txBin, $offset);                
+                if ($tx['is_relevant']) {$transactions[] = $tx;} else {$skipped++;}
+                $offset += $tx['length'];
+            }
+        } else {
+            $offset = 0;
+            $version = unpack("V", substr($buffer, $offset, 4))[1];
+            $offset += 4;    
+            $prevBlock = strrev(substr($buffer, $offset, 32));
+            $offset += 32;
+            $merkleRoot = strrev(substr($buffer, $offset, 32));
+            $offset += 32;
+            $timestamp = unpack("V", substr($buffer, $offset, 4))[1];
+            $offset += 4;
+            $bits = unpack("V", substr($buffer, $offset, 4))[1];
+            $offset += 4;
+            $nonce = unpack("V", substr($buffer, $offset, 4))[1];
+            $offset += 4;
+            $header = [
+                'version' => $version,
+                'prevBlock' => bin2hex($prevBlock),
+                'merkleRoot' => bin2hex($merkleRoot),
+                'timestamp' => $timestamp,
+                'bits' => $bits,
+                'nonce' => $nonce
+            ];
+            $offset = 80; // Skip block header just for clarity
+            if ($version & (1 << 8)) {$this->skipAuxPowHeader($buffer, $offset);}
             
-            $tx['original']=$i; // to track skipped transactions; not used currently
-            $tx['offset']=$offset;
-            //$transactions[] = $tx;
-            if ($tx['is_relevant']) {$transactions[] = $tx;} else {$skipped++;}
-            $offset += $tx['length'];
+            $txCountSize = 0;
+            $txCount = $this->parseVarInt($buffer, $offset, $txCountSize);
+            $offset += $txCountSize;    
+            for ($i = 0; $i < $txCount; $i++) {
+                $tx = $this->parseTransactionLite($buffer, $offset);
+                $tx['original']=$i; // to track skipped transactions; not used currently
+                $tx['offset']=$offset;
+                if ($tx['is_relevant']) {$transactions[] = $tx;} else {$skipped++;}
+                $offset += $tx['length'];
+            }
         }
         return [
             'txCount' => $txCount,
@@ -711,6 +1009,7 @@ class BlockParser { /* Unravels a binary block */
         }
     
         // 3. Parse inputs (vin)
+        $vinCountOffset = $offset;
         $vinCountLen = 0;
         $vinCount = $this->parseVarInt($buffer, $offset, $vinCountLen);
         $offset += $vinCountLen;
@@ -740,7 +1039,8 @@ class BlockParser { /* Unravels a binary block */
             $output=$this->parseOutput($buffer, $offset);
             if ($output[1]!=false) {$outputs[]=[$i,$output[0],$output[1]];} // n,value (P),hash; you could trace OP_RETURNS here using n=-1 and output[0]
         }
-    
+        $outputsEnd = $offset;
+        
         // 6. If SegWit, parse witness for each input
         if ($isSegWit) {
             for ($i = 0; $i < $vinCount; $i++) {
@@ -767,7 +1067,17 @@ class BlockParser { /* Unravels a binary block */
             if (count($outputs)==0){$isRelevant=false;}
         }
         if ($isRelevant) {
-            $txBytes=substr($buffer,$startOffset,$offset - $startOffset);  // Legacy
+            if ($isSegWit) {
+                $preInputsLen = $vinStart - $startOffset;
+                $inputsLen = $voutStart - $vinStart;
+                $locktimeLen = 4;
+                $txBytes =
+                    substr($buffer, $startOffset, 4) . // version
+                    substr($buffer, $vinCountOffset, $outputsEnd - $vinCountOffset) . // vinCount + inputs + voutCount + outputs
+                    $locktime;
+            } else {
+                $txBytes=substr($buffer,$startOffset,$offset - $startOffset);  // Legacy
+            }
             $txid = bin2hex(strrev(hash('sha256', hash('sha256', $txBytes, true), true)));
         } else {
             $txid = null;
@@ -994,48 +1304,47 @@ class BlockParser { /* Unravels a binary block */
         $offset += $scriptLen;
     } 
 }
-
 function base58check_decode($base58) {
     $alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
-    $chars = str_split($base58);
-    $num = 0;
+    $base58chars = str_split($base58);
 
-    foreach ($chars as $char) {
+    // 1. Decode base58 naar bytes-array (grote-endian)
+    $bytes = [0];
+    foreach ($base58chars as $char) {
         $pos = strpos($alphabet, $char);
-        if ($pos === false) {
-            return false; // invalid character
+        if ($pos === false) return false;
+        // $bytes = $bytes * 58 + $pos
+        $carry = $pos;
+        for ($i = 0; $i < count($bytes); $i++) {
+            $carry += $bytes[$i] * 58;
+            $bytes[$i] = $carry & 0xFF; // % 256
+            $carry >>= 8; // floor($carry / 256)
         }
-        $num = bcmul($num, '58');
-        $num = bcadd($num, (string)$pos);
+        while ($carry > 0) {
+            $bytes[] = $carry & 0xFF;
+            $carry >>= 8;
+        }
+    }
+    // De bytes zijn nu little-endian, omdraaien voor verder gebruik
+    $bin = '';
+    foreach (array_reverse($bytes) as $b) {
+        $bin .= chr($b);
     }
 
-    // Convert number to binary
-    $hex = '';
-    while (bccomp($num, '0') > 0) {
-        $mod = bcmod($num, '256');
-        $num = bcdiv($num, '256', 0);
-        $hex = str_pad(dechex($mod), 2, '0', STR_PAD_LEFT) . $hex;
-    }
-
-    // Add leading zero bytes
+    // 2. Leading '1's in base58 zijn \x00 bytes
     $pad = 0;
-    for ($i = 0; $i < strlen($base58) && $base58[$i] === '1'; $i++) {
-        $pad++;
-    }
+    for ($i = 0; $i < strlen($base58) && $base58[$i] === '1'; $i++) $pad++;
+    $bin = str_repeat("\x00", $pad) . $bin;
 
-    $binary = str_repeat("\x00", $pad) . hex2bin($hex);
+    // 3. Check minimaal 4 bytes (checksum)
+    if (strlen($bin) < 4) return false;
 
-    // Validate checksum
-    if (strlen($binary) < 4) return false;
-    $payload = substr($binary, 0, -4);
-    $checksum = substr($binary, -4);
+    $payload = substr($bin, 0, -4);
+    $checksum = substr($bin, -4);
     $hash = substr(hash('sha256', hash('sha256', $payload, true), true), 0, 4);
 
-    if ($checksum !== $hash) {
-        return false; // invalid checksum
-    }
-
-    return $payload; // version byte + data (usually: 1 byte + 20-byte pubkeyHash)
+    if ($checksum !== $hash) return false;
+    return $payload;
 }
 function pubkeyhash_from_base58_address($address) {
     $decoded = base58check_decode($address);
@@ -1048,7 +1357,8 @@ function pubkeyhash_from_base58_address($address) {
 
     return bin2hex($pubkeyHash);
 }
-function address_from_pubkeyhash(string $pubkeyHashHex, int $version) {
+function address_from_pubkeyhash(string $pubkeyHash) {
+    global $version;
     if ($pubkeyHash === false || strlen($pubkeyHash) !== 20) {
         return false;
     }
@@ -1060,33 +1370,41 @@ function address_from_pubkeyhash(string $pubkeyHashHex, int $version) {
 function base58_encode(string $bin): string {
     static $alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 
-    // 1) Convert binary data to a big-integer string in base-10
-    $dec = '0';
-    $len = strlen($bin);
-    for ($i = 0; $i < $len; $i++) {
-        // dec = dec * 256 + ord(bin[i])
-        $dec = bcmul($dec, '256', 0);
-        $dec = bcadd($dec, (string)ord($bin[$i]), 0);
+    // Convert binary data to an array of byte values
+    $bytes = array_map('ord', str_split($bin));
+
+    $result = '';
+    // While there are still non-zero bytes
+    while (count($bytes) > 0) {
+        $carry = 0;
+        $newBytes = [];
+        foreach ($bytes as $b) {
+            // acc = carry * 256 + b
+            $acc = ($carry << 8) + $b;
+            // quo = acc / 58, rem = acc % 58
+            $quo = intdiv($acc, 58);
+            $carry = $acc % 58;
+            // skip leading zeros in newBytes
+            if (count($newBytes) > 0 || $quo !== 0) {
+                $newBytes[] = $quo;
+            }
+        }
+        // carry is remainder ? next Base58 digit
+        $result = $alphabet[$carry] . $result;
+        $bytes = $newBytes;
     }
 
-    // 2) Repeatedly divmod 58, collecting remainders
-    $out = '';
-    while (bccomp($dec, '0', 0) > 0) {
-        $rem = bcmod($dec, '58');
-        $dec = bcdiv($dec, '58', 0);
-        $out .= $alphabet[(int)$rem];
-    }
-    $out = strrev($out);
-
-    // 3) Preserve leading zero bytes as '1'
-    $pad = '';
-    for ($i = 0; $i < $len && $bin[$i] === "\x00"; $i++) {
-        $pad .= '1';
+    // Add 1 for each leading 0x00 byte in input
+    foreach (str_split($bin) as $ch) {
+        if ($ch === "\x00") {
+            $result = $alphabet[0] . $result;
+        } else {
+            break;
+        }
     }
 
-    return $pad . $out;
+    return $result;
 }
-
 class JsonRpcClient {
     private $url;
     private $id = 0;
@@ -1262,7 +1580,7 @@ function pack_array(string $format, array $args): string {
 function hashtable_add_TX(&$table,$record){
 /*  An index to search for IDs that arrive as a byte-string with data associated in $record
     Hash is the wrong word but these id's are unique and random as if it were hashes;
-    We take the last four bytes (% modulus x) and therefor collistions occur
+    We take the last four bytes (% modulus x) and therefor collisions occur
     These collisions are linked by using the last record-entry (must be provided as zero).
    
     The index consists of two memory-structures:
@@ -1332,7 +1650,7 @@ function hashtable_add_TX(&$table,$record){
     return $bucket_index;
 }
 function hashtable_add_PUB(&$table,$record){
-    /*  pub(36):    [0]scripthash(20) [1]blocknr/lastchange(4) [2]first-txo(4) [3]last-txo(4) [4]next hash%-collistion(4) */
+    /*  pub(36):    [0]scripthash(20) [1]blocknr/lastchange(4) [2]first-txo(4) [3]last-txo(4) [4]next hash%-collision(4) */
     static $link_max;
     $ID=$record[0];
     $block=$record[1];
@@ -1367,6 +1685,7 @@ function hashtable_add_PUB(&$table,$record){
                 $content[1]=$block;    // change marker
                 $content[3]=$last_txo; // carefull again
                 hashtable_write($table['bucket'],$linked_list,$content);
+                $table['bucket'][TOP]--;
                 return ([$linked_list,$previous_last_txo]); //<--- exit
             } 
             $next = $content[array_key_last($content)];
