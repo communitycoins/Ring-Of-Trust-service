@@ -56,7 +56,8 @@ L("==== Start ".now()." ====\n\n");
 @unlink("TXidx");
 @unlink("BLKidx");
 
-list($tikker,$user,$ww,$port,$datadir)=explode("|",trim(file_get_contents(ROOT."rot.conf")));
+list($tikker,$user,$ww,$rpcport,$socket,$datadir)=explode("|",trim(file_get_contents(ROOT."rot.conf")));
+define ("SOCKET",$socket);
 $tikker=strtoupper($tikker);
 $versions["LTC"]=48;$versions["BTC"]=0x00;$versions["CDN"]=28;$versions["DEM"]=53;$versions["EFL"]=48;$versions["AUR"]=23;$versions["PAK"]=0x00;$versions["SLG"]=0x00;$versions["RUBTC"]=0x00;$versions["FJC"]=0x00;$versions["BOLI"]=0x00;$versions["CESC"]=0x00;
 $version=$versions[$tikker];
@@ -78,7 +79,7 @@ $rpc = [
     'user' => $user,
     'pass' => $ww,
     'host' => '127.0.0.1',
-    'port' => $port
+    'port' => $rpcport
 ];
 
 $RPC=new JsonRPCClient($rpc);   // Though minimalistic, we need core
@@ -362,7 +363,7 @@ function extractBlocksFromStream(): Generator {
         }
     }
     if ($fileNumber==-1){L("Strange 'currentFile' {$currentFile} in parsecontext\n");die();}
-                           
+    
     $handle = fopen($currentFile, 'rb');
     while (true) {                            // 'yields' after every block encountered
         while (true) {                        // In the blk*.dat file-stream fork-blocks occur and can be skipped
@@ -465,15 +466,30 @@ function extractBlocksFromStream(): Generator {
             } else {
                 if ($raceToTheTop) {$raceToTheTop=false;}
             }
-        } else {$raceToTheTop=false;}
+        } else {
+            $raceToTheTop=false;
+        }
         
         // No news from blockchain;
         $serviceTime=microtime(true);
-        handleClientRequests();
-        $serviceTime=microtime(true)-$serviceTime;
-        if ((1000000 - $serviceTime)>0) {usleep(1000000 - $serviceTime);}
-        
+        handleSocketRequests($serviceTime+1); // may take longer, but try to return
     }
+}
+function stripResources(array $table){ // to allow serialization
+    // 
+    $filtered = [];
+    foreach ($table as $ksub => $sub) {
+        if (is_array($sub)) {   
+            foreach ($sub as $k => $v) {
+                if (!(($k==P)||($k==KEY))) {
+                    $filtered[$ksub][$k] = $v;
+                }
+            }
+        } else {
+            $filtered[$ksub]=$sub;
+        }
+    }
+    return $filtered;
 }
 function backup($full=false){
     /* Backup occurs at $parseContext['height']. The block at that height was fully indexed
@@ -490,9 +506,9 @@ function backup($full=false){
         if ($date_1>$date_2) {$postfix="_backup_2";} else {$postfix="_backup_1";}
         L("Backup $postfix at height {$parseContext['height']}: ");
         
-        file_put_contents("TX_aux$postfix",serialize($TX_table));
-        file_put_contents("PUB_aux$postfix",serialize($PUB_table));
-        file_put_contents("TXO_aux$postfix",serialize($TXO_table));
+        file_put_contents("TX_aux$postfix",serialize(stripResources($TX_table)));
+        file_put_contents("PUB_aux$postfix",serialize(stripResources($PUB_table)));
+        file_put_contents("TXO_aux$postfix",serialize(stripResources($TXO_table)));
         file_put_contents("$postfix",serialize($parseContext));
         
         dump_index($TX_table,"hash","TX_hash$postfix");
@@ -500,9 +516,9 @@ function backup($full=false){
     } else {
         L("Backup Full at height {$parseContext['height']}: ");
         file_put_contents("AUX",serialize($parseContext));
-        file_put_contents("TX_aux",serialize($TX_table));
-        file_put_contents("PUB_aux",serialize($PUB_table));
-        file_put_contents("TXO_aux",serialize($TXO_table));
+        file_put_contents("TX_aux",serialize(stripResources($TX_table)));
+        file_put_contents("PUB_aux",serialize(stripResources($PUB_table)));
+        file_put_contents("TXO_aux",serialize(stripResources($TXO_table)));
         dump_index($TX_table,"hash","TX_hash");
         dump_index($PUB_table,"hash","PUB_hash");
         dump_index($TX_table,"bucket","TX_bucket");
@@ -570,228 +586,266 @@ function recover($full=false) { // Rewinds to a valid backup-tip
         L("rewind to height {$parseContext['height']}: \n");
     }
 }
-function handleClientRequests() {
-    global $height,$TX_table,$TXO_table,$PUB_table,$version;
-    $requests=glob(Q."/*");
-    foreach($requests as $request){
-        $destination=str_replace(Q,A,$request);
-	$output="Request error: $request\n";
-        $cmd=file($request,FILE_IGNORE_NEW_LINES);
-        $file=basename($request);
-        @list($a,$b)=explode(":",$cmd[0]);
-        $a=strtolower($a);
-        $start=microtime(true);
-        if ($a=="blk") {
-            findBlok($b);
-            echo "(".(microtime(true)-$start).")\n";
-        } elseif ($a=="testrich"){
-            /* retrieve by (chrome)
-               right-click "rank 1" + inspect
-               right-click "<tbody> + copy INNERhtml
-               paste this as A."/rich.dat"
-               - Remember: coinbase transactions (mined inputs) and non-legacy outputs (non-PSPKH) are not indexed
-               - The forth column is the pubtable index; retrieve it by sending the request pubtable:index
-            */
-            $html=file_get_contents(A."/rich.dat");
-            $dom = new DOMDocument();
-            libxml_use_internal_errors(true); // Suppress warnings for invalid HTML
-            $dom->loadHTML($html);
-            libxml_clear_errors();
-            $rows = $dom->getElementsByTagName('tr');
-            foreach ($rows as $row) {
-                $cells = $row->getElementsByTagName('td');
-                if ($cells->length >= 5) {
-                    $col1 = trim($cells->item(0)->textContent); 
-                    $col2 = trim($cells->item(1)->textContent); 
-                    $col3 = trim($cells->item(2)->textContent); 
-                    $rich[]="$col1 | $col2 | $col3\n";
-                }
-            }
+function handleSocketRequests(float $deadline){
+    static $clients = [];
+    static $server;
 
-            $n=$PUB_table['bucket'][TOP];
-            for ($i=1;$i<=$n;$i++){
-                $record=hashtable_read($PUB_table['bucket'],$i);
-                $short=substr(address_from_pubkeyhash($record[0]),0,8);
-                $pubs[$short]=$i;
-                file_put_contents(A."/short",$short."\n",FILE_APPEND);
-                if (($i%10000)==0) {echo "$i\n";}
-            }
-            foreach ($rich as $line) {
-                $item=explode("|",trim($line));
-                if (count($item)==3){
-                    $pub=substr(trim($item[1]),0,8);
-                    $sum=0;
-                    if (isset($pubs[$pub])) {
-                        $record=hashtable_read($PUB_table['bucket'],$pubs[$pub]);
-                        $txo=hashtable_read($TXO_table['bucket'],$record[2]);
-                        while ($txo[3]==$pubs[$pub]){
-                            if ($txo[4]==0) {$sum+=$txo[2];}
-                            if ($txo[5]!=0){
-                                $txo=hashtable_read($TXO_table['bucket'],$txo[5]);
-                            } else {
-                                $txo[3]=0;
-                            }
-                        }
-                        echo trim($line)." | {$pubs[$pub]} | $sum\n";
-                    } else { 
-                        echo trim($line)." | ?\n";
-                    }
+    if ($server === null) {
+        $server = stream_socket_server("tcp://0.0.0.0:".SOCKET, $errno, $errstr);
+        if (!$server) {die("Socket error: $errstr ($errno)");}
+        stream_set_blocking($server, false);
+    }
+    $write  = [];    // unused, but must be an array
+    $except = [];    // also unused, but must be an array
+    while (microtime(true) < $deadline) {
+        $read = $clients;
+        $read[] = $server;
+
+        $remainingTime = $deadline - microtime(true);
+        if ($remainingTime <= 0) break;
+
+        $timeout_sec = 0;
+        $timeout_usec = ($remainingTime * 1e6); //(int)
+
+        $ready = stream_select($read, $write, $except, $timeout_sec, $timeout_usec); // What scenarios could occur here?
+        if ($ready === false) break; // error
+
+        foreach ($read as $sock) {
+            if ($sock === $server) {
+                $client = stream_socket_accept($server, 0);
+                if ($client) {
+                    stream_set_blocking($client, false);
+                    $clients[] = $client;
                 }
-            }            
-        } elseif ($a=="tx"){
-            [$index,$record]=find($TX_table,hex2bin($b));
-            if ($index){
-                echo "\n{$cmd[0]}";
-                echo "index:$index\n";
-                echo "txId:".bin2hex($record[0])."\n";
-                echo "block:{$record[1]}\n";
-                echo "txo-pointer:{$record[2]}\n";
-                echo "collision:{$record[3]}\n";
-                $txo=hashtable_read($TXO_table['bucket'],$record[2]);
-                $i=0;
-                while ($txo[0]==$index) {
-                    $pub=hashtable_read($PUB_table['bucket'],$txo[3]);
-                    $base58=address_from_pubkeyhash($pub[0]);
-                    echo "n:{$txo[1]} value:{$txo[2]} pub:$base58 spend:{$txo[4]} linked-list:{$txo[5]}\n";
-                    $i++;
-                    $txo=hashtable_read($TXO_table['bucket'],$record[2]+$i);                    
-                }
-            }
-            echo "(".(microtime(true)-$start).")\n\n";            
-        } elseif ($a=="pub"){
-  //TX_table-bucket(44):  [0]txid(32) + [1]blocknr/lastchange(4) + [2]txo-pointer(4) + [3]collision-linked-list(4)
-  //PUB_table-bucket(36): [0]scripthash(20) + [1]blocknr/lastchange(4) + [2]first txo(4) + [3]last txo(4) + [4]collision-linked-list(4)
-  //TXO_table_bucket(28): [0]txin(4) + [1]nout(4) + [2]value(8) + [3]scripthash(4) + [4]txout/spend(4) + [5]scripthash-linkedlist(4) 
-            
-            $payload=base58check_decode($b);
-            if ($payload) {
-                $pubkeyhash=substr($payload,1);
-                [$index,$record]=find($PUB_table,$pubkeyhash);
-                if ($record[0]==$pubkeyhash) {
-                    echo "\n{$cmd[0]}";
-                    echo "\nversion:$version\n";
-                    echo "\npkhash:".bin2hex($record[0]);
-                    echo "\nblocknr/Lastchange:".$record[1];
-                    echo "\nfirst txo:".$record[2];
-                    echo "\nlast txo:".$record[3];
-                    $txo=hashtable_read($TXO_table['bucket'],$record[2]);
-                    $sum=0;$n=0;
-                    while ($txo[3]==$index){
-                        $n++;
-                        if ($txo[4]==0) {
-                            $tx=hashtable_read($TX_table['bucket'],$txo[0]);
-                            echo "\n".bin2hex($tx[0]).":".$txo[1].":".$txo[2];
-                            $sum+=$txo[2];
-                        }
-                        if ($txo[5]!=0){
-                            $txo=hashtable_read($TXO_table['bucket'],$txo[5]);
-                        } else {
-                            $txo[3]=0;
-                        }
-                    }                    
-                    echo "\ntxo total:$n";                            
-                    echo "\nbalance:$sum\n";
-                }
-            }
-            echo "(".(microtime(true)-$start).")\n\n";
-        } elseif ($a=="puball"){
-            $payload=base58check_decode($b);
-            if ($payload) {
-                $pubkeyhash=substr($payload,1);
-                [$index,$record]=find($PUB_table,$pubkeyhash);
-                if ($record[0]==$pubkeyhash) {
-                    echo "\n{$cmd[0]}";
-                    echo "\npkhash:".bin2hex($record[0]);
-                    echo "\nblocknr/Lastchange:".$record[1];
-                    echo "\nfirst txo:".$record[2];
-                    echo "\nlast txo:".$record[3];
-                    $txo=hashtable_read($TXO_table['bucket'],$record[2]);
-                    $sum=0;$sum_in=0;$sum_out=0;$n=0;$n_in=0;$n_out=0;
-                    while ($txo[3]==$index){
-                        $n++;
-                        $sum+=$txo[2];
-                        if ($txo[4]==0) {
-                            $tx=hashtable_read($TX_table['bucket'],$txo[0]);
-                            echo "\n".$n.":".bin2hex($tx[0]).":".$txo[1].":".$txo[2];
-                            $sum_in+=$txo[2];
-                            $n_in++;
-                        }else{
-                            $tx=hashtable_read($TX_table['bucket'],$txo[4]);
-                            echo "\n".$n.":".bin2hex($tx[0]).":".$txo[1].":".$txo[2];
-                            $sum_out+=$txo[2];
-                            $n_out++;
-                        }
-                        if ($txo[5]!=0){
-                            $txo=hashtable_read($TXO_table['bucket'],$txo[5]);
-                        } else {
-                            $txo[3]=0;
-                        }
-                    }                    
-                    echo "\ntxo total:$n spend:$n_out rest:$n_in";
-                    echo "\nInput:$sum spend:$sum_out rest:$sum_in\n";
-                }
-            }
-            echo "(".(microtime(true)-$start).")\n\n";
-        } elseif ($a=="blkblunt") {
-            echo "\n{$cmd[0]}";
-            $n=$TX_table['bucket'][TOP];
-            $found=false;
-            for ($i=1;$i<=$n;$i++){
-                $record=hashtable_read($TX_table['bucket'],$i);
-                if ($record[1]==$b) {
-                    echo bin2hex($record[0])."\n";
-                    $found=true;
+            } else {
+                $line = stream_get_line($sock, 65536, "\n");
+                $meta = stream_get_meta_data($sock);
+                if ($meta['timed_out'] || $line === false || feof($sock)) {
+                    fclose($sock);
+                    $clients = array_filter($clients, fn($c) => $c !== $sock);
                 } else {
-                    if ($found) {break;}
+                    $response = handleClientRequest($line);
+                    fwrite($sock, $response . "\n");
+                    fflush($sock);
+                    fclose($sock);
+                    $clients = array_filter($clients, fn($c) => $c !== $sock);
                 }
             }
-            echo "(".(microtime(true)-$start).")\n\n";
-        } elseif ($a=="txtable") {
-            echo "\n{$cmd[0]}";
-            if ($b==""){print_r($TX_table);
-            }elseif ($b=="performance") {
-                $n=$TX_table['bucket'][TOP];
-                for ($i=1;$i<=$n;$i++){$record=hashtable_read($TX_table['bucket'],$i);}
-            }elseif (is_numeric($b)) {
-                $record = hashtable_read($TX_table['bucket'],$b);
-                print_r($record);
-                echo bin2hex($record[0])."\n";
-            }
-            echo "(".(microtime(true)-$start).")\n\n";
-        } elseif ($a=="txotable") {
-            echo "\n{$cmd[0]}";
-            if ($b==""){print_r($TXO_table);
-            }elseif ($b=="performance") {
-                $n=$TXO_table['bucket'][TOP];
-                for ($i=1;$i<=$n;$i++){$record=hashtable_read($TXO_table['bucket'],$i);}
-            }elseif (is_numeric($b)) {
-                $record = hashtable_read($TXO_table['bucket'],$b);
-                print_r($record);
-            }
-            echo "(".(microtime(true)-$start).")\n\n";
-        } elseif ($a=="pubtable") {
-            echo "\n{$cmd[0]}";
-            if ($b==""){print_r($PUB_table);
-            }elseif ($b=="performance") {
-                $n=$PUB_table['bucket'][TOP];
-                for ($i=1;$i<=$n;$i++){$record=hashtable_read($PUB_table['bucket'],$i);}
-            }elseif (is_numeric($b)) {
-                $record = hashtable_read($PUB_table['bucket'],$b);
-                echo "scripthash:".bin2hex($record[0])."\n";
-                echo "base58:".address_from_pubkeyhash($record[0])."\n";
-                echo "blocknr last change:{$record[1]}\n";
-                echo "first txo:{$record[2]}\n";
-                echo "last txo:{$record[3]}\n";
-                echo "collision:{$record[4]}\n";
-            }
-            echo "(".(microtime(true)-$start).")\n\n";
-        }elseif ($a=="stop") {
-            echo "\n{$cmd[0]}";
-            unlink("$request");
-	    die("\n");
         }
-        if (file_exists($destination)) {@unlink($request);} else {rename($request,$destination);}        
-    }    
+    }
+}
+    
+function handleClientRequest($request) {
+    global $height,$TX_table,$TXO_table,$PUB_table,$version;
+    
+    $start=microtime(true);
+    $cmd=explode("|",trim($request));
+    if (count($cmd)!=3) {  // ID|CMD|params
+        return "?";
+    }
+    $a=$cmd[1];$b=$cmd[2];
+    $output="";
+    if ($a=="blk") {
+        $n=$TX_table['bucket'][TOP];
+        $found=false;
+        for ($i=1;$i<=$n;$i++){
+            $record=hashtable_read($TX_table['bucket'],$i);
+            if ($record[1]==$b) {
+                $output.=bin2hex($record[0])."\n";
+                $found=true;
+            } else {
+                if ($found) {break;}
+            }
+        }
+        $output.="(".(microtime(true)-$start).")\n";
+    } elseif ($a=="testrich"){
+        /* retrieve by (chrome)
+           right-click "rank 1" + inspect
+           right-click "<tbody> + copy INNERhtml
+           paste this as A."/rich.dat"
+           - Remember: coinbase transactions (mined inputs) and non-legacy outputs (non-PSPKH) are not indexed
+           - The forth column is the pubtable index; retrieve it by sending the request pubtable:index
+        */
+        $html=file_get_contents(A."/rich.dat");
+        $dom = new DOMDocument();
+        libxml_use_internal_errors(true); // Suppress warnings for invalid HTML
+        $dom->loadHTML($html);
+        libxml_clear_errors();
+        $rows = $dom->getElementsByTagName('tr');
+        foreach ($rows as $row) {
+            $cells = $row->getElementsByTagName('td');
+            if ($cells->length >= 5) {
+                $col1 = trim($cells->item(0)->textContent); 
+                $col2 = trim($cells->item(1)->textContent); 
+                $col3 = trim($cells->item(2)->textContent); 
+                $rich[]="$col1 | $col2 | $col3\n";
+            }
+        }
+
+        $n=$PUB_table['bucket'][TOP];
+        for ($i=1;$i<=$n;$i++){
+            $record=hashtable_read($PUB_table['bucket'],$i);
+            $short=substr(address_from_pubkeyhash($record[0]),0,8);
+            $pubs[$short]=$i;
+            file_put_contents(A."/short",$short."\n",FILE_APPEND);
+            if (($i%10000)==0) {$output.="$i\n";}
+        }
+        foreach ($rich as $line) {
+            $item=explode("|",trim($line));
+            if (count($item)==3){
+                $pub=substr(trim($item[1]),0,8);
+                $sum=0;
+                if (isset($pubs[$pub])) {
+                    $record=hashtable_read($PUB_table['bucket'],$pubs[$pub]);
+                    $txo=hashtable_read($TXO_table['bucket'],$record[2]);
+                    while ($txo[3]==$pubs[$pub]){
+                        if ($txo[4]==0) {$sum+=$txo[2];}
+                        if ($txo[5]!=0){
+                            $txo=hashtable_read($TXO_table['bucket'],$txo[5]);
+                        } else {
+                            $txo[3]=0;
+                        }
+                    }
+                    $output.=trim($line)." | {$pubs[$pub]} | $sum\n";
+                } else { 
+                    $output.=trim($line)." | ?\n";
+                }
+            }
+        }            
+    } elseif ($a=="tx"){
+        [$index,$record]=find($TX_table,hex2bin($b));
+        if ($index){
+            $output.="\n{$cmd[0]}";
+            $output.= "index:$index\n";
+            $output.= "txId:".bin2hex($record[0])."\n";
+            $output.= "block:{$record[1]}\n";
+            $output.= "txo-pointer:{$record[2]}\n";
+            $output.= "collision:{$record[3]}\n";
+            $txo=hashtable_read($TXO_table['bucket'],$record[2]);
+            $i=0;
+            while ($txo[0]==$index) {
+                $pub=hashtable_read($PUB_table['bucket'],$txo[3]);
+                $base58=address_from_pubkeyhash($pub[0]);
+                $output.= "n:{$txo[1]} value:{$txo[2]} pub:$base58 spend:{$txo[4]} linked-list:{$txo[5]}\n";
+                $i++;
+                $txo=hashtable_read($TXO_table['bucket'],$record[2]+$i);                    
+            }
+        }
+        $output.= "(".(microtime(true)-$start).")\n\n";            
+    } elseif ($a=="pub"){
+        $payload=base58check_decode($b);
+        if ($payload) {
+            $pubkeyhash=substr($payload,1);
+            [$index,$record]=find($PUB_table,$pubkeyhash);
+            if ($record[0]==$pubkeyhash) {
+                $output.= "\n{$cmd[0]}";
+                $output.= "\nversion:$version\n";
+                $output.= "\npkhash:".bin2hex($record[0]);
+                $output.= "\nblocknr/Lastchange:".$record[1];
+                $output.= "\nfirst txo:".$record[2];
+                $output.= "\nlast txo:".$record[3];
+                $txo=hashtable_read($TXO_table['bucket'],$record[2]);
+                $sum=0;$n=0;
+                while ($txo[3]==$index){
+                    $n++;
+                    if ($txo[4]==0) {
+                        $tx=hashtable_read($TX_table['bucket'],$txo[0]);
+                        $output.= "\n".bin2hex($tx[0]).":".$txo[1].":".$txo[2];
+                        $sum+=$txo[2];
+                    }
+                    if ($txo[5]!=0){
+                        $txo=hashtable_read($TXO_table['bucket'],$txo[5]);
+                    } else {
+                        $txo[3]=0;
+                    }
+                }                    
+                $output.= "\ntxo total:$n";                            
+                $output.= "\nbalance:$sum\n";
+            }
+        }
+        $output.= "(".(microtime(true)-$start).")\n\n";
+    } elseif ($a=="puball"){
+        $payload=base58check_decode($b);
+        if ($payload) {
+            $pubkeyhash=substr($payload,1);
+            [$index,$record]=find($PUB_table,$pubkeyhash);
+            if ($record[0]==$pubkeyhash) {
+                $output.= "\n{$cmd[0]}";
+                $output.= "\npkhash:".bin2hex($record[0]);
+                $output.= "\nblocknr/Lastchange:".$record[1];
+                $output.= "\nfirst txo:".$record[2];
+                $output.= "\nlast txo:".$record[3];
+                $txo=hashtable_read($TXO_table['bucket'],$record[2]);
+                $sum=0;$sum_in=0;$sum_out=0;$n=0;$n_in=0;$n_out=0;
+                while ($txo[3]==$index){
+                    $n++;
+                    $sum+=$txo[2];
+                    if ($txo[4]==0) {
+                        $tx=hashtable_read($TX_table['bucket'],$txo[0]);
+                        $output.= "\n".$n.":".bin2hex($tx[0]).":".$txo[1].":".$txo[2];
+                        $sum_in+=$txo[2];
+                        $n_in++;
+                    }else{
+                        $tx=hashtable_read($TX_table['bucket'],$txo[4]);
+                        $output.= "\n".$n.":".bin2hex($tx[0]).":".$txo[1].":".$txo[2];
+                        $sum_out+=$txo[2];
+                        $n_out++;
+                    }
+                    if ($txo[5]!=0){
+                        $txo=hashtable_read($TXO_table['bucket'],$txo[5]);
+                    } else {
+                        $txo[3]=0;
+                    }
+                }                    
+                $output.= "\ntxo total:$n spend:$n_out rest:$n_in";
+                $output.= "\nInput:$sum spend:$sum_out rest:$sum_in\n";
+            }
+        }
+        $output.= "(".(microtime(true)-$start).")\n\n";
+    } elseif ($a=="txtable") {
+        if ($b==""){$output.=print_r($TX_table,true);
+        }elseif ($b=="performance") {
+            $n=$TX_table['bucket'][TOP];
+            for ($i=1;$i<=$n;$i++){$record=hashtable_read($TX_table['bucket'],$i);}
+        }elseif (is_numeric($b)) {
+            $record = hashtable_read($TX_table['bucket'],$b);
+            $output.=print_r($record,true);
+            $output.= bin2hex($record[0])."\n";
+        }
+        $output.= "(".(microtime(true)-$start).")\n\n";
+    } elseif ($a=="txotable") {
+        if ($b==""){print_r($TXO_table);
+        }elseif ($b=="performance") {
+            $n=$TXO_table['bucket'][TOP];
+            for ($i=1;$i<=$n;$i++){$record=hashtable_read($TXO_table['bucket'],$i);}
+        }elseif (is_numeric($b)) {
+            $record = hashtable_read($TXO_table['bucket'],$b);
+            $output.=print_r($record,true);
+        }
+        $output.= "(".(microtime(true)-$start).")\n\n";
+    } elseif ($a=="pubtable") {
+        if ($b==""){$output.=print_r($PUB_table,true);
+        }elseif ($b=="performance") {
+            $n=$PUB_table['bucket'][TOP];
+            for ($i=1;$i<=$n;$i++){$record=hashtable_read($PUB_table['bucket'],$i);}
+        }elseif (is_numeric($b)) {
+            $record = hashtable_read($PUB_table['bucket'],$b);
+            $output.= "scripthash:".bin2hex($record[0])."\n";
+            $output.= "base58:".address_from_pubkeyhash($record[0])."\n";
+            $output.= "blocknr last change:{$record[1]}\n";
+            $output.= "first txo:{$record[2]}\n";
+            $output.= "last txo:{$record[3]}\n";
+            $output.= "collision:{$record[4]}\n";
+        }
+        $output.= "(".(microtime(true)-$start).")\n\n";
+    }elseif ($a=="stop") {
+        die("\n");
+    }
+    if ($output=="") {
+        return "!";
+    }else{
+        return $output;        
+    }
 }
 function findBlok($block) {
     global $TX_table,$height;
