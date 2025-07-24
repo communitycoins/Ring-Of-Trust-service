@@ -528,7 +528,7 @@ function backup($full=false){
     L((microtime(true)-$time)."(s)\n");
 }
 function recover($full=false) { // Rewinds to a valid backup-tip
-    global $TX_table,$PUB_table,$TXO_table,$parseContext;  
+    global $TX_table,$PUB_table,$TXO_table,$parseContext,$RPC;  
     $time=microtime(true);
 
     if ($full) {
