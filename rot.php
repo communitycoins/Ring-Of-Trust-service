@@ -70,7 +70,8 @@ if (strpos($rpcport,":")>0) {list($rpchost,$rpcport)=explode(":",$rpcport);}
 $tikker=strtoupper($tikker);
 $versionByte=$versionsBytes[$tikker];
 define ("SOCKET",$socket);
-L("==== Start ".now()." Version ".VERSION." $tikker ====\n\n");
+
+L("==== Start ".now()." Version ".VERSION."  $tikker ====\n\n");
 
 if (substr($datadir,-1)!="/") {$datadir.="/";}
 if (file_exists("{$datadir}blocks")) {$datadir.="blocks/";}
@@ -744,14 +745,10 @@ function handleClientRequest($request) {
     }
     $a=$cmd[1];$b=$cmd[2];
     $output="";
-    if ($a=="blk") {
-        if (!is_integer($b)||(($b<1)||($b>$height))) {
-            if (!is_integer($b)) {$output="b is not an integer\n";}
-            if ($b<1) {$output="b<1\n";}
-            if ($b>$height) {$output="$b>$height\n";}
+    if ($a=="blk") {        
+        if (!isValidIntString($b,$height)) {
             $output="$b:$height\n";
         } else {
-            if (($b<1)||($b>$height)) {die();}
             $n=$TX_table['bucket'][TOP];
             $found=false;
             for ($i=1;$i<=$n;$i++){
@@ -1935,5 +1932,13 @@ function find($table,$ID){
         } while ($next!=0);
         return [false,[]];
     }
+}
+function isValidIntString(string $s, int $max): bool {
+    // allow only digits and no leading sign; disallow leading zeros (01) — tweak if you want them
+    if (!preg_match('/^[1-9]\d*$/', $s)) return false;
+    $val = filter_var($s, FILTER_VALIDATE_INT, [
+        'options' => ['min_range' => 1, 'max_range' => $max]
+    ]);
+    return $val !== false;
 }
 ?>
