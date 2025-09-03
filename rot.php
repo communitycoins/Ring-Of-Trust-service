@@ -21,7 +21,7 @@
   [index](size)    
   TX_table-bucket(44):  [0]txid(32) + [1]blocknr/lastchange(4) + [2]txo-pointer(4) + [3]collision-linked-list(4)
   PUB_table-bucket(36): [0]scripthash(20) + [1]blocknr/lastchange(4) + [2]first txo(4) + [3]last txo(4) + [4]collision-linked-list(4)
-  TXO_table_bucket(28): [0]txin(4) + [1]nout(4) + [2]value(8) + [3]scripthash(4) + [4]txout/spend(4) + [5]scripthash-linkedlist(4) 
+  TXO_table_bucket(28): [0]txin(4) + [1]nout(4) + [2]value(8) + [3]scripthash(4) + [4]txout/spend(4) + [5]scripthash-txo-linkedlist(4) 
   
   +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
    The main loop starts at extractBlocksFromStream(). This is a "generator" and retrieves blocks sequentially but un-ordered from blocks/blk*.dat   
@@ -30,19 +30,22 @@
    - extractBlocksFromStream loads blocks encountered serially but stores those "out of sync" in $blockbuffer[]
    - Block 0 is skipped
    
-   **TXdata** all legacy transactions serialized through parsing of blk*.dat
+   **TXdata** all legacy non-coinbase transactions serialized through parsing of blk*.dat
    **TXidx**  For each block a pointer to the first transaction in **TXdata** for that block plus the amount of relevant transactions in that block
    **BLKidx** for each block a 6-byte pointer into blk*.dat
 
-   If you search for  a transaction (find()) you will get a four-byte pointer to its position in blk*.dat.
-   There you can retrieve the raw-transaction but more importantly it serves as a replacement to TXid in (U)TXO tables
-   **blockparser*.log** progress report
   +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 */   
 
+$options = getopt('c:h', ['config:', 'help']);
+if (isset($options['h']) || isset($options['help'])) {die("Usage: php rot.php --config=/path/to/rot.conf\n");}
+$configPath = $options['c'] ?? $options['config'] ?? getenv('ROT_CONFIG') ?? null;
+if (!$configPath) {die("Error: --config is required (or set ROT_CONFIG)\n");}
+if (!is_file($configPath)) {die("Error: config not found: $configPath\n");}
+list($tikker,$user,$ww,$rpcport,$socket,$datadir)=explode("|",trim(file_get_contents($configPath)));
+
 define ("VERSION","0.1");
-define("LOG","blockparser.log");
-define("ROOT",dirname(__FILE__)."/");
+define("ROOT",dirname($configPath)."/");
 define("Q",ROOT."Q");
 define("A",ROOT."A");
 define("DATA",ROOT."data/");
@@ -55,17 +58,16 @@ $alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 $versionsBytes = ["LTC" => 48,"BTC" => 0x00,"CDN" => 28,"DEM" => 53,"EFL" => 48,"AUR" => 23,"PAK" => 0x00,"SLG" => 0x00,"RUBTC" => 0x00,
                   "FJC" => 0x00,"BOLI" => 0x00,"CESC" => 0x00];
 function now(){return date('d-m-Y H:i');}
-function L($what){file_put_contents(LOG,$what,FILE_APPEND);echo $what;}
+function L($what){file_put_contents(ROOT."rot.log",$what,FILE_APPEND);echo $what;}
 if (!function_exists('array_key_last')) {function array_key_last(array $array) {if (empty($array)) {return null;}return key(array_slice($array, -1, 1, true));}}
 
 $start=time();
 @unlink(DATA."TXidx");
 @unlink(DATA."BLKidx");
-file_put_contents("pid",getmypid());
-register_shutdown_function(function(){@unlink("pid");});
+file_put_contents(ROOT."pid",getmypid());
+register_shutdown_function(function(){@unlink(ROOT."pid");});
 
 $rpchost='127.0.0.1';
-list($tikker,$user,$ww,$rpcport,$socket,$datadir)=explode("|",trim(file_get_contents(ROOT."rot.conf")));
 if (strpos($rpcport,":")>0) {list($rpchost,$rpcport)=explode(":",$rpcport);}
 $tikker=strtoupper($tikker);
 $versionByte=$versionsBytes[$tikker];
@@ -151,7 +153,7 @@ if (!$recovery){
     $TX_table['hash'][RECORDSIZE]=LONG;
     $TX_table['hash'][SIZE]=$TX_table['N']*$TX_table['hash'][RECORDSIZE];
     $TX_table['hash'][TOP]=$TX_table['N']; // De hoogste GEVULDE index
-    $TX_table['hash'][NAME]='hash';
+    $TX_table['hash'][NAME]='TX-hash';
     
     $TX_table['bucket'][P]=0;
     $TX_table['bucket'][INCREMENT]=$TX_table['increment'];
@@ -160,7 +162,7 @@ if (!$recovery){
     $TX_table['bucket'][RECORDSIZE]=32+3*LONG;
     $TX_table['bucket'][SIZE]=$TX_table['bucket'][INCREMENT];
     $TX_table['bucket'][TOP]=0;
-    $TX_table['bucket'][NAME]='bucket';
+    $TX_table['bucket'][NAME]='TX-bucket';
     $TX_table['hash'][KEY]=ftok(__FILE__, 'A');
     $TX_table['bucket'][KEY]=ftok(__FILE__, 'B');
     hashtable_initialize($TX_table['hash']);
@@ -173,7 +175,7 @@ if (!$recovery){
     $PUB_table['hash'][RECORDSIZE]=LONG;
     $PUB_table['hash'][SIZE]=$TX_table['N']*LONG;
     $PUB_table['hash'][TOP]=$TX_table['N']; // De hoogste GEVULDE index
-    $PUB_table['hash'][NAME]='hash';
+    $PUB_table['hash'][NAME]='PUB-hash';
     $PUB_table['bucket'][P]=0;
     $PUB_table['bucket'][INCREMENT]=$TX_table['increment'];
     $PUB_table['bucket'][FORMAT_PACK]="a20V4"; 
@@ -181,7 +183,7 @@ if (!$recovery){
     $PUB_table['bucket'][RECORDSIZE]=20+4*LONG;
     $PUB_table['bucket'][SIZE]=$PUB_table['bucket'][INCREMENT];
     $PUB_table['bucket'][TOP]=0;
-    $PUB_table['bucket'][NAME]='bucket';
+    $PUB_table['bucket'][NAME]='PUB-bucket';
     $PUB_table['hash'][KEY]=ftok(__FILE__, 'C');
     $PUB_table['bucket'][KEY]=ftok(__FILE__, 'D');
     hashtable_initialize($PUB_table['hash']);
@@ -195,7 +197,7 @@ if (!$recovery){
     $TXO_table['bucket'][RECORDSIZE]=28;
     $TXO_table['bucket'][SIZE]=$TXO_table['bucket'][INCREMENT];
     $TXO_table['bucket'][TOP]=0;
-    $TXO_table['bucket'][NAME]='bucket';
+    $TXO_table['bucket'][NAME]='TXO-bucket';
     $TXO_table['bucket'][KEY]=ftok(__FILE__, 'E');
     hashtable_initialize($TXO_table['bucket']);
 
@@ -233,15 +235,19 @@ foreach (extractBlocksFromStream() as $entry) {
         if ($entry['prevHash']!=$lastBlockHash) { // There we have one
             L("We are on a different track (previous hash:{$entry['prevHash']}): REWIND\n");
             recover();
-            $height=$parseContext['height']+1;
+            $height=$parseContext['height'];
             $lastBlockHash = $RPC->call('getblockhash', [$height]);
+            $height++;
+            L("\nProceeding at block $height\nPrevious blockhash:$lastBlockHash\n");            
             continue;
-        } elseif (file_exists("recover")) {
+        } elseif (file_exists(ROOT."recover")) {
             L("recovery test: REWIND\n");
             recover();
-            $height=$parseContext['height']+1;
+            $height=$parseContext['height'];
             $lastBlockHash = $RPC->call('getblockhash', [$height]);
-            @unlink("recover");
+            $height++;
+            L("\nProceeding at block $height\nPrevious blockhash:$lastBlockHash\n");            
+            @unlink(ROOT."recover");
             continue;
         }
     } elseif ($entry['id']>$height) {
@@ -291,13 +297,16 @@ foreach (extractBlocksFromStream() as $entry) {
                 $next_txoID=$TXO_table['bucket'][TOP]+1; //
                 [$pubID,$previous_last_txo]=hashtable_add_PUB($PUB_table,[$output[2],$height,$next_txoID,$next_txoID,0]);
 
-                // txo(28):    [0]txin(4) [1]nout(4) [2]value(8) [3]scripthash(4) [4]txout(4) [5]next scripthash occurence(4)
+                // txo(28):    [0]txin(4) [1]nout(4) [2]value(8) [3]scripthash(4) [4]txout(4) [5]next scripthash txo(4)
                 $txoID=flattable_append($TXO_table,[$txID,$output[0],$output[1],$pubID,0,0]);
                 if ($previous_last_txo!=$txoID) { //correct linked list
+                    if ($previous_last_txo==0) {
+                        L("Append txo, but previous-last is zero");
+                    }
                     $content=hashtable_read($TXO_table['bucket'],$previous_last_txo);
                     $content[5]=$txoID;
                     hashtable_write($TXO_table['bucket'],$previous_last_txo,$content);  // All outputs to a scrypthash are inter-linked
-                }
+                }   // else hashtable_add_PUB didn't actually add PUB but updated the last-txo
             }
 
             if (!$tx['is_segwit']){ // Spend. Don't need to service inputs from segwit-tx; Cannot be spend by cc-wallets; Legacy wallets don't see them anyway
@@ -307,7 +316,7 @@ foreach (extractBlocksFromStream() as $entry) {
                     if ($index!==false){
                         // [0]txid(32) + [1]blocknr/lastchange(4) + [2]txo-pointer(4) + [3]next-hash-collision(4)
                         // txo[0]:9 txo[1]:0 txo[2]:2500000000 txo[3]:12 txo[4]:0 txo[5]:0
-                        // [0]txin(4) - [1]nout(4) - [2]value(8) - [3]scripthash(4) - [4]txout/spend(4) - [5]next scripthash occurence(4) 
+                        // [0]txin(4) - [1]nout(4) - [2]value(8) - [3]scripthash(4) - [4]txout/spend(4) - [5]next scripthash txo(4) 
                         $txo=hashtable_read($TXO_table['bucket'],$record[2]);
                         $i=0;
                         while (($txo[0]==$index)&&($txo[1]<$prev_vout)){
@@ -637,8 +646,9 @@ function handleSocketRequests(float $deadline){
         if (!$server) {die("Socket error: $errstr ($errno)");}
         stream_set_blocking($server, false);
     }
-    $write  = [];    // unused, during stream_select, but must be an array
-    $except = [];    // also unused, but must be an array
+    $write  = null;
+    $except = null;
+    $timeout_sec=0;
     while (microtime(true) < $deadline) {
         $read = $clients;
         $read[] = $server;
@@ -646,9 +656,9 @@ function handleSocketRequests(float $deadline){
         $remainingTime = $deadline - microtime(true);
         if ($remainingTime <= 0) break;
 
-        $timeout_sec = 0;
-        $timeout_usec = ($remainingTime * 1e6); //(int)
-
+        $timeout_usec = (int) floor(($remainingTime - $timeout_sec) * 1000000);
+        if ($timeout_usec > 999999) { $timeout_sec += 1; $timeout_usec = 0; } // guard
+        
         $ready = stream_select($read, $write, $except, $timeout_sec, $timeout_usec); 
         if ($ready === false) break; // error
 
@@ -1723,13 +1733,27 @@ function load_index(&$table,$part,$where=""){
 function trunc_bucket(&$table){
     // Trunc the buckets simply by setting link-list entries to zero if they point higher than SIZE
     $top=$table['bucket'][TOP];
-    for ($i=0;$i<$top;$i++) {
+    for ($i=1;$i<=$top;$i++) {
         $content=hashtable_read($table['bucket'],$i);
-        if ($content[$link]>$top) {
-           $content[$link]=0;
-           hashtable_write($table['bucket'],$content);
-        }
+        if ($content[3]>$top) {
+           $content[3]=0;  // collision pointer
+           hashtable_write($table['bucket'],$i,$content);
+        } 
     }    
+}
+function trunc_txo(&$table){
+    /* txo(28):    [0]txin(4) [1]nout(4) [2]value(8) [3]scripthash(4) [4]txout(4) [5]next scripthash txo(4)
+       pub(36):    [0]scripthash(20) [1]blocknr/lastchange(4) [2]first-txo(4) [3]last-txo(4) [4]next hash%-collision(4)
+       start at the TOP and run untill the previous TOP
+       TXO gets truncated put PUB needs to be updated
+       A TXO not only has its own linked list But it is also embedded in PUB
+       - you know PUB-TOP so if txo[3]>PUB-top then skip : dus 
+       - else lees PUB;
+       
+       Hoe kan Error TXO-bucket Vtxin/Vnout/Pvalue/Vhash/Vtxout/Vnext 0 28 ontstaan, want dan moet er een txo=0 pointer zijn
+       
+    */
+    $top=$table['bucket'][TOP];
 }
 function hashtable_initialize(&$table){
     $table[P]=@shmop_open($table[KEY],"n",0666, $table[SIZE]);
