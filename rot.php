@@ -58,7 +58,7 @@ $alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 $versionsBytes = ["LTC" => 48,"BTC" => 0x00,"CDN" => 28,"DEM" => 53,"EFL" => 48,"AUR" => 23,"PAK" => 0x00,"SLG" => 0x00,"RUBTC" => 0x00,
                   "FJC" => 0x00,"BOLI" => 0x00,"CESC" => 0x00];
 function now(){return date('d-m-Y H:i');}
-function L($what){file_put_contents(ROOT."rot.log",$what,FILE_APPEND);echo $what;}
+function L($what){$extra="";if (substr($what,-1)!="\n"){$extra="\n";}file_put_contents(ROOT."rot.log",$what,FILE_APPEND);echo $what.$extra;}
 if (!function_exists('array_key_last')) {function array_key_last(array $array) {if (empty($array)) {return null;}return key(array_slice($array, -1, 1, true));}}
 
 $start=time();
@@ -125,7 +125,6 @@ if (file_exists(DATA."AUX")){ // Recover...
         L("Recovering ...");
         recover(true);
         $height=$parseContext['height']+1; // Next height to look for
-        L("\nProceeding at block $height\n");
         $recovery=true;
     } else {
         L("Failover hash doesn't match core's vision \nRestarting ...\n");
@@ -233,20 +232,18 @@ foreach (extractBlocksFromStream() as $entry) {
     if ($raceToTheTop==false) { // Got block through RPC but anticipate reorganisations
         L("New block:".$entry['hash']."; height $height\n");
         if ($entry['prevHash']!=$lastBlockHash) { // There we have one
-            L("We are on a different track (previous hash:{$entry['prevHash']}): REWIND\n");
+            L("We are on a orphaned block at height $height\n");
             recover();
             $height=$parseContext['height'];
             $lastBlockHash = $RPC->call('getblockhash', [$height]);
             $height++;
-            L("\nProceeding at block $height\nPrevious blockhash:$lastBlockHash\n");            
             continue;
         } elseif (file_exists(ROOT."recover")) {
-            L("recovery test: REWIND\n");
+            L("recovery test: REWIND at $height\n");
             recover();
             $height=$parseContext['height'];
             $lastBlockHash = $RPC->call('getblockhash', [$height]);
             $height++;
-            L("\nProceeding at block $height\nPrevious blockhash:$lastBlockHash\n");            
             @unlink(ROOT."recover");
             continue;
         }
@@ -299,7 +296,7 @@ foreach (extractBlocksFromStream() as $entry) {
 
                 // txo(28):    [0]txin(4) [1]nout(4) [2]value(8) [3]scripthash(4) [4]txout(4) [5]next scripthash txo(4)
                 $txoID=flattable_append($TXO_table,[$txID,$output[0],$output[1],$pubID,0,0]);
-                if ($previous_last_txo!=$txoID) { //correct linked list
+                if ($previous_last_txo!=$txoID) { //Existing PUB; correct linked list of TXO's
                     if ($previous_last_txo==0) {
                         L("Append txo, but previous-last is zero");
                     }
@@ -585,9 +582,8 @@ function recover($full=false) { // Rewinds to a valid backup-tip
         load_index($PUB_table,'bucket',DATA."PUB_bucket");
         load_index($TXO_table,'bucket',DATA."TXO_bucket");
     } else {
-        L("Reorganisation at {$parseContext['height']}\n");
-        if (file_exists(DATA."_backup_1")) {$delta_1=time()-filemtime(DATA."_backup_1");} else {$date_1=time();}
-        if (file_exists(DATA."_backup_2")) {$delta_2=time()-filemtime(DATA."_backup_2");} else {$date_2=time();}
+        if (file_exists(DATA."_backup_1")) {$delta_1=time()-filemtime(DATA."_backup_1");} else {$delta_1=time();}
+        if (file_exists(DATA."_backup_2")) {$delta_2=time()-filemtime(DATA."_backup_2");} else {$delta_2=time();}
         if ($delta_1>$delta_2) {$postfix="_backup_2";} else {$postfix="_backup_1";} // try youngest first
         L("Recover $postfix at height {$parseContext['height']}\n");
     
@@ -600,7 +596,7 @@ function recover($full=false) { // Rewinds to a valid backup-tip
             if ($hash!=$parseContext['hash']) { // Oeps hoped this wouldn't occur; Both backups dont conform. Try latest Full backup
                 $parseContext=unserialize(file_get_contents(DATA."AUX"));
                 if ($hash!=$parseContext['hash']) {                    
-                    die("Cannot recover from backup at height {$parseContext['height']}\n Try full recovery (remove AUX).");
+                    die("Cannot recover from backup at height {$parseContext['height']}\n Try full recovery (remove contents of data-directory).");
                 } else {
                     recover(true);
                     return;
@@ -608,21 +604,70 @@ function recover($full=false) { // Rewinds to a valid backup-tip
             }
         }
 
-        L("rewind to height {$parseContext['height']}: \n");
-        $TX_table_backup=unserialize(file_get_contents(DATA."TX_aux"));
-        $PUB_table_backup=unserialize(file_get_contents(DATA."PUB_aux"));
-        $TXO_table_backup=unserialize(file_get_contents(DATA."TXO_aux"));
+        $TX_table_backup=unserialize(file_get_contents(DATA."TX_aux".$postfix));
+        $PUB_table_backup=unserialize(file_get_contents(DATA."PUB_aux".$postfix));
+        $TXO_table_backup=unserialize(file_get_contents(DATA."TXO_aux".$postfix));
 
         hashtable_initialize($TX_table['hash']);
         hashtable_initialize($PUB_table['hash']);
         load_index($TX_table,'hash',DATA."TX_hash$postfix");
         load_index($PUB_table,'hash',DATA."PUB_hash$postfix");
+        
+        //PUB_table-bucket(36): [0]scripthash(20) + [1]blocknr/lastchange(4) + [2]first txo(4) + [3]last txo(4) + [4]collision-linked-list(4)
+        //TXO_table_bucket(28): [0]txin(4) + [1]nout(4) + [2]value(8) + [3]scripthash(4) + [4]txout/spend(4) + [5]scripthash-txo-linkedlist(4) 
+        $truncTXOEnd  =$TXO_table['bucket'][TOP];
+        $truncTXOStart=$TXO_table_backup['bucket'][TOP]+1;
+        $truncPUBstart=$PUB_table_backup['bucket'][TOP]+1;
+        if (DEBUG) {L("$truncTXOStart,$truncTXOEnd,$truncPUBstart\n");}
+        $affected=[];
+        for ($i=$truncTXOStart;$i<=$truncTXOEnd;$i++) {
+            $content=hashtable_read($TXO_table['bucket'],$i);
+            if ($content[3]<$truncPUBstart) {$affected[$content[3]]=true;}
+        }
+        L((1+$truncTXOEnd-$truncTXOStart)." txo's concerned; ".count($affected)." pubkeys affected.\n");
+        foreach ($affected as $PUB_index=>$dummy){
+            $PUB_content=hashtable_read($PUB_table['bucket'],$PUB_index);
+            $more=true;
+            $TXO_index=$PUB_content[2];  // first
+            while ($more) {
+                $TXO_content=hashtable_read($TXO_table['bucket'],$TXO_index);
+                if ($TXO_content[5]==0) {
+                    L('Broken TXO-linked list');
+                    die();
+                } elseif ($TXO_content[5]>=$truncTXOStart) {
+                    $more=false;
+                    $PUB_content[3]=$TXO_index;
+                    hashtable_write($PUB_table['bucket'],$PUB_index,$PUB_content);
+                    $TXO_content[5]=0;
+                    hashtable_write($TXO_table['bucket'],$TXO_index,$TXO_content);
+                } else {
+                    $TXO_index=$TXO_content[5];  // next
+                }
+            }            
+        }
         $TX_table['bucket'][TOP]=$TX_table_backup['bucket'][TOP];
         $PUB_table['bucket'][TOP]=$PUB_table_backup['bucket'][TOP];
         $TXO_table['bucket'][TOP]=$TXO_table_backup['bucket'][TOP];
-        trunc_bucket($TX_table);
-        trunc_bucket($PUB_table);
-        trunc_bucket($TXO_table);
+        // trunc TX_table; ($i=1 Can be optimized by finding the first transaction at blockheight==backup[TOP])
+        $collisionPointer=3;
+        $top=$TX_table['bucket'][TOP];
+        for ($i=1;$i<=$top;$i++) {
+            $content=hashtable_read($TX_table['bucket'],$i);
+            if ($content[$collisionPointer]>$top) {
+               $content[$collisionPointer]=0;
+               hashtable_write($TX_table['bucket'],$i,$content);
+            } 
+        }
+        // trunc PUB_table
+        $collisionPointer=4;
+        $top=$PUB_table['bucket'][TOP];
+        for ($i=1;$i<=$top;$i++) {
+            $content=hashtable_read($PUB_table['bucket'],$i);
+            if ($content[$collisionPointer]>$top) {
+               $content[$collisionPointer]=0;
+               hashtable_write($PUB_table['bucket'],$i,$content);
+            } 
+        }
     }
 }
 function handleSocketRequests(float $deadline){
@@ -659,8 +704,15 @@ function handleSocketRequests(float $deadline){
         $timeout_usec = (int) floor(($remainingTime - $timeout_sec) * 1000000);
         if ($timeout_usec > 999999) { $timeout_sec += 1; $timeout_usec = 0; } // guard
         
-        $ready = stream_select($read, $write, $except, $timeout_sec, $timeout_usec); 
-        if ($ready === false) break; // error
+        $ready = @stream_select($read, $write, $except, $timeout_sec, $timeout_usec); 
+        if ($ready === false) {
+            $err = error_get_last();
+            if (strpos($err['message'] ?? '', 'Interrupted system call') !== false) {
+                continue; // harmless
+            }
+            L("stream_select failed: " . $err['message']);
+            break;
+        }
 
         foreach ($read as $sock) {
             if ($sock === $server) {
@@ -1730,31 +1782,6 @@ function load_index(&$table,$part,$where=""){
     }
     fclose($fp);
 }
-function trunc_bucket(&$table){
-    // Trunc the buckets simply by setting link-list entries to zero if they point higher than SIZE
-    $top=$table['bucket'][TOP];
-    for ($i=1;$i<=$top;$i++) {
-        $content=hashtable_read($table['bucket'],$i);
-        if ($content[3]>$top) {
-           $content[3]=0;  // collision pointer
-           hashtable_write($table['bucket'],$i,$content);
-        } 
-    }    
-}
-function trunc_txo(&$table){
-    /* txo(28):    [0]txin(4) [1]nout(4) [2]value(8) [3]scripthash(4) [4]txout(4) [5]next scripthash txo(4)
-       pub(36):    [0]scripthash(20) [1]blocknr/lastchange(4) [2]first-txo(4) [3]last-txo(4) [4]next hash%-collision(4)
-       start at the TOP and run untill the previous TOP
-       TXO gets truncated put PUB needs to be updated
-       A TXO not only has its own linked list But it is also embedded in PUB
-       - you know PUB-TOP so if txo[3]>PUB-top then skip : dus 
-       - else lees PUB;
-       
-       Hoe kan Error TXO-bucket Vtxin/Vnout/Pvalue/Vhash/Vtxout/Vnext 0 28 ontstaan, want dan moet er een txo=0 pointer zijn
-       
-    */
-    $top=$table['bucket'][TOP];
-}
 function hashtable_initialize(&$table){
     $table[P]=@shmop_open($table[KEY],"n",0666, $table[SIZE]);
     if (!$table[P]) {
@@ -1861,14 +1888,13 @@ function hashtable_add_TX(&$table,$record){
     return $bucket_index;
 }
 function hashtable_add_PUB(&$table,$record){
-    /*  pub(36):    [0]scripthash(20) [1]blocknr/lastchange(4) [2]first-txo(4) [3]last-txo(4) [4]next hash%-collision(4) */
+     // Will only add a pub-key record if it doest exist yet. Returns a pointer to the bucket-list position (new or old). Also returns a pointer to the last TXO
     static $link_max;
     $ID=$record[0];
     $block=$record[1];
-    $last_txo=$record[3]; // carefull with this hard-coding
+    $last_txo=$record[3]; // carefull with this hard-coding (actually TXO_table[TOP]+1)
     $previous_last_txo=$record[3];
 
-    // add new record to bucket-list
     $bucket_index=$table['bucket'][TOP]+1;
     if ($bucket_index*$table['bucket'][RECORDSIZE]>$table['bucket'][SIZE]) { //make room
         dump_index($table,'bucket');
@@ -1915,10 +1941,6 @@ function hashtable_add_PUB(&$table,$record){
     return ([$bucket_index,$previous_last_txo]);
 }
 function flattable_append(&$table,$record){
-/*              "V2PV3";
-                "Vtxin/Vnout/Pvalue/Vhash/Vtxout/Vnext"; 
-                flattable_append($TXO_table,[$txID,$output[0],$output[1],$pubID,0,0]);
-*/
     $bucket_index=$table['bucket'][TOP]+1;
     if ($bucket_index*$table['bucket'][RECORDSIZE]>$table['bucket'][SIZE]) { //make room
         dump_index($table,'bucket');
@@ -1958,7 +1980,7 @@ function find($table,$ID){
     }
 }
 function isValidIntString(string $s, int $max): bool {
-    // allow only digits and no leading sign; disallow leading zeros (01) — tweak if you want them
+    // allow only digits and no leading sign; disallow leading zeros (01)
     if (!preg_match('/^[1-9]\d*$/', $s)) return false;
     $val = filter_var($s, FILTER_VALIDATE_INT, [
         'options' => ['min_range' => 1, 'max_range' => $max]
