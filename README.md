@@ -39,8 +39,8 @@ Except for PHP >= 7.4 (2019) there are zero dependancies except for the core-wal
 If you have docker available there is no need for PHP on your host either. Just use this Dockerfile to build a virtual php-image:
 
 Dockerfile:
-FROM php:8.3-cli
-RUN docker-php-ext-install shmop
+```FROM php:8.3-cli
+RUN docker-php-ext-install shmop```
 
 Build the image from the command-line with: docker build -t cc-php-rot:8.3 .
 
