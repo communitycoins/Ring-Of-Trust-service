@@ -22,15 +22,57 @@ Three articles further motivate design choices for the ROT-implementation
 - [Why We Choose Legacy](https://medium.com/@support_4739/why-we-choose-legacy-3376b8f9415c)
 - [Rethinking SPV](https://medium.com/@support_4739/rethinking-spv-toward-a-stateless-peer-verified-backend-layer-for-blockchain-light-clients-7fd5e2906601)
 - [Enhanced Stateless, Poll-Optimized Light Client Network Architecture: A Technical Analysis](https://medium.com/@support_4739/title-enhanced-stateless-poll-optimized-light-client-network-architecture-a-technical-analysis-9f54243e71f5)
-## Source
 
-### rot.php
+## Source rot.php
 
 SPV-server that serves legacy-only light clients P2PKH-addresses.
-- Use a single line pipe-delimited configuration file: rot.conf 
-  - coin-name| 
+
+Uses a single line pipe-delimited configuration file: rot.conf 
+  - coin-tikker| 
   - rpc-user|
   - rpc-ww|
   - rpc-port|
+  - rot service-port|
   - block data directory
 
+Except for PHP >= 7.4 (2019) there are zero dependancies except for the core-wallet is services. 
+If you have docker available there is no need for PHP on your host either. Just use this Dockerfile to build a virtual php-image:
+
+Dockerfile:
+FROM php:8.3-cli
+RUN docker-php-ext-install shmop
+
+Build the image from the command-line with: docker build -t cc-php-rot:8.3 .
+
+In the example that follows rot.php is places at `/var/data/communitycoins/rot`,
+the corewallet datadirectory at `/var/data/communitycoins/<coin>/blockchain`,
+the rot datadirectory at `/var/data/communitycoins/<coin>/rot`
+
+rot is started with ./rot.sh <coin>
+rot is stopped with docker stop rot-<coin>
+if you service multiple coins use `docker ps -a --filter name='rot-' --format 'table {{.Names}}\t{{.Status}}'` for an overview
+Errors are logged per coin at `/var/data/communitycoins/rot/rot_<coin.log>`
+A monitor-logfile is available at `/var/data/communitycoins/<coin>/rot/rot.log`
+
+rot.sh:
+```#!/usr/bin/env bash
+[ -z "$1" ] && { echo "Usage: $0 <coin>"; exit 2; }
+
+docker rm -f "rot-$1" >/dev/null 2>&1 || true
+
+ROOT="/var/data/communitycoins"
+COIN="$1"
+
+docker run -d \
+  --name "rot-$COIN" \
+  --network host \
+  --log-driver=none \
+  -v "$ROOT:$ROOT" \
+  cc-php-rot:8.3 php \
+    -d memory_limit=2G \
+    -d log_errors=1 \
+    -d error_reporting=E_ALL \
+    -d display_errors=1 \
+    -d error_log="/var/data/communitycoins/rot/rot_$COIN.log" \
+  $ROOT/rot/rot.php --config="$ROOT/$COIN/rot/rot.conf"
+```
