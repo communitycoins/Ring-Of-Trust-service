@@ -48,10 +48,12 @@ In the example that follows rot.php is places at `/var/data/communitycoins/rot`,
 the corewallet datadirectory at `/var/data/communitycoins/<coin>/blockchain`,
 the rot datadirectory at `/var/data/communitycoins/<coin>/rot`
 
-rot is started with ./rot.sh <coin>
-rot is stopped with docker stop rot-<coin>
+rot is started with `./rot.sh <coin>`,
+rot is stopped with `docker stop rot-<coin>`;
 if you service multiple coins use `docker ps -a --filter name='rot-' --format 'table {{.Names}}\t{{.Status}}'` for an overview
+
 Errors are logged per coin at `/var/data/communitycoins/rot/rot_<coin.log>`
+
 A monitor-logfile is available at `/var/data/communitycoins/<coin>/rot/rot.log`
 
 rot.sh:
