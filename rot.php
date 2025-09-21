@@ -58,7 +58,7 @@ $alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 $versionsBytes = ["LTC" => 48,"BTC" => 0x00,"CDN" => 28,"DEM" => 53,"EFL" => 48,"AUR" => 23,"PAK" => 0x00,"SLG" => 0x00,"RUBTC" => 0x00,
                   "FJC" => 0x00,"BOLI" => 0x00,"CESC" => 0x00];
 function now(){return date('d-m-Y H:i');}
-function L($what){$extra="";if (substr($what,-1)!="\n"){$extra="\n";}file_put_contents(ROOT."rot.log",$what,FILE_APPEND);echo $what.$extra;}
+function L($what){$extra="";if (($what!=".")&&(substr($what,-1)!="\n")){$extra="\n";}file_put_contents(ROOT."rot.log",$what.$extra,FILE_APPEND);echo $what.$extra;}
 if (!function_exists('array_key_last')) {function array_key_last(array $array) {if (empty($array)) {return null;}return key(array_slice($array, -1, 1, true));}}
 
 $start=time();
@@ -120,7 +120,10 @@ $TXidx="";$TXdata="";$TX_sum=0;$BLKidx="";
 $recovery=false;
 if (file_exists(DATA."AUX")){ // Recover...
     $parseContext=unserialize(file_get_contents(DATA."AUX"));
-    $hash = $RPC->call('getblockhash', [$parseContext['height']]);
+    while (true) {
+        $hash = $RPC->call('getblockhash', [$parseContext['height']]);
+        if ($hash!==null) {break;}
+    }
     if ($hash==$parseContext['hash']) { 
         L("Recovering ...");
         recover(true);
@@ -143,8 +146,18 @@ if (!$recovery){
     $TX_table['N']			=10000000;   // hash-positions (4-bytes a piece) -> 40Mb
     $TX_table['increment']              =100000000;  // increment empty space to prevent frequent reallocations (100 Mb)                                        
     if (($tikker=='LTC')||($tikker=='BTC')||($tikker=='DOGE')) {$multiplier=10;} else {$multiplier=1;}   // hash-positions -> 400Mb
+    $bucketPercentage=1; // reduce memory based on history
+    if ($tikker=='EFL') {
+        $bucketPercentage=0.2; 
+    } elseif ($tikker=='CDN') {
+        $bucketPercentage=0.5;
+    } elseif ($tikker=='AUR') {
+        $bucketPercentage=1;
+    } elseif ($tikker=='CESC') {
+        $bucketPercentage=0.3;
+    }
     $TX_table['N']*=$multiplier;
-    $TX_table['increment']*=$multiplier;
+    $TX_table['increment']*=$multiplier*$bucketPercentage;  
     
     $TX_table['hash'][P]=0;
     $TX_table['hash'][FORMAT_PACK]="V";
@@ -159,7 +172,7 @@ if (!$recovery){
     $TX_table['bucket'][FORMAT_PACK]="a32V3";  
     $TX_table['bucket'][FORMAT_UNPACK]="a32tx/Vblock/Vtxo/Vnext"; 
     $TX_table['bucket'][RECORDSIZE]=32+3*LONG;
-    $TX_table['bucket'][SIZE]=$TX_table['bucket'][INCREMENT];
+    $TX_table['bucket'][SIZE]=$TX_table['bucket'][INCREMENT]*$bucketPercentage;
     $TX_table['bucket'][TOP]=0;
     $TX_table['bucket'][NAME]='TX-bucket';
     $TX_table['hash'][KEY]=ftok(__FILE__, 'A');
@@ -180,7 +193,7 @@ if (!$recovery){
     $PUB_table['bucket'][FORMAT_PACK]="a20V4"; 
     $PUB_table['bucket'][FORMAT_UNPACK]="a20hash/Vblock/Vfirst/Vlast/Vnext"; // Should I maintain balances too? > richlist
     $PUB_table['bucket'][RECORDSIZE]=20+4*LONG;
-    $PUB_table['bucket'][SIZE]=$PUB_table['bucket'][INCREMENT];
+    $PUB_table['bucket'][SIZE]=$PUB_table['bucket'][INCREMENT]*$bucketPercentage;
     $PUB_table['bucket'][TOP]=0;
     $PUB_table['bucket'][NAME]='PUB-bucket';
     $PUB_table['hash'][KEY]=ftok(__FILE__, 'C');
@@ -194,7 +207,7 @@ if (!$recovery){
     $TXO_table['bucket'][FORMAT_PACK]="V2PV3"; 
     $TXO_table['bucket'][FORMAT_UNPACK]="Vtxin/Vnout/Pvalue/Vhash/Vtxout/Vnext"; 
     $TXO_table['bucket'][RECORDSIZE]=28;
-    $TXO_table['bucket'][SIZE]=$TXO_table['bucket'][INCREMENT];
+    $TXO_table['bucket'][SIZE]=$TXO_table['bucket'][INCREMENT]*$bucketPercentage;
     $TXO_table['bucket'][TOP]=0;
     $TXO_table['bucket'][NAME]='TXO-bucket';
     $TXO_table['bucket'][KEY]=ftok(__FILE__, 'E');
@@ -235,14 +248,20 @@ foreach (extractBlocksFromStream() as $entry) {
             L("We are on a orphaned block at height $height\n");
             recover();
             $height=$parseContext['height'];
-            $lastBlockHash = $RPC->call('getblockhash', [$height]);
+            while (true) {
+                $lastBlockHash = $RPC->call('getblockhash', [$height]);
+                if ($lastBlockHash!==null) {break;}
+            }
             $height++;
             continue;
         } elseif (file_exists(ROOT."recover")) {
             L("recovery test: REWIND at $height\n");
             recover();
             $height=$parseContext['height'];
-            $lastBlockHash = $RPC->call('getblockhash', [$height]);
+            while (true) {
+                $lastBlockHash = $RPC->call('getblockhash', [$height]);
+                if ($lastBlockHash!==null) {break;}
+            }
             $height++;
             @unlink(ROOT."recover");
             continue;
@@ -280,6 +299,8 @@ foreach (extractBlocksFromStream() as $entry) {
             backup(); // No need to toutch backupHeight
         }
         $parsed = $parser->getBlock($entry['raw']);
+/// fresh parsed block        
+        
         $skipped+=$parsed['skipped'];
         $relevant+=count($parsed['transactions']);
         if (!$fullBackup){
@@ -390,6 +411,7 @@ function extractBlocksFromStream(): Generator {
     if ($fileNumber==-1){L("Strange 'currentFile' {$currentFile} in parsecontext\n");die();}
     
     $handle = fopen($currentFile, 'rb');
+    $last_error="";$repeat_error=0;
     while (true) {                            // 'yields' after every block encountered
         while (true) {                        // In the blk*.dat file-stream fork-blocks occur and can be skipped
             if ($raceToTheTop) { // Read available complete blocks from current file;
@@ -427,41 +449,35 @@ function extractBlocksFromStream(): Generator {
                 }
                 $blkvalid++;
             } else { // Turn to RPC
-                try {
+                while (true) {
                     $blockHash     = $RPC->call('getblockhash',[$height]);
-                    $rawHex        = $RPC->call('getblock',[$blockHash, false]);
-                    $newHeight     = $height;
-                    if ($tikker=="DEM") {
-                        $blockData     = $rawHex;
-                        $prevBlockHash = $rawHex['previousblockhash'];
-                    } else {
-                        $blockData     = hex2bin($rawHex);
-                        $blockLength   = strlen($blockData);
-                        $prevBlockHash = bin2hex(strrev(substr($blockData, 4, 32)));
-                    }
-                    if (!$tipReached) {
-                        if ($height>=$top) {
-                            $top=$RPC->call('getblockcount',[]);
-                            if ($height-1==$top) {$tipReached=true;} // height is the next block we are waiting for
-                        }
-                    }
-                } catch (\GuzzleHttp\Exception\ConnectException $e) {
-                    if (!$coreFailure) {
-                        $coreFailure=true;
-                        L("Cannot reach core: ".now()." ". $e->getMessage());
-                    }
-                    sleep(10);
-                    break;
-                } catch (Exception $e) { // Not available yet
-                    $coreFailure=false;
-                    if (strpos($e->getMessage(),'"code":-8')===false) {
-                    if (strpos($e->getMessage(),'"code":-1')===false) {
-                        L('Caught exception: '.$e->getMessage()."\n");
-                    }}
-                    sleep(1);
-                    break;
+                    if ($blockHash<0) {
+                        break;
+                    } elseif ($blockHash!==null) {break;}   // new block                     
                 }
-                $coreFailure=false;                
+                if ($blockHash<0) {break;} // no block yet
+                while (true){
+                    $rawHex        = $RPC->call('getblock',[$blockHash, false]);
+                    if ($rawHex!==null) {break;}
+                }
+                $newHeight     = $height;
+                if ($tikker=="DEM") {
+                    $blockData     = $rawHex;
+                    $prevBlockHash = $rawHex['previousblockhash'];
+                } else {
+                    $blockData     = hex2bin($rawHex);
+                    $blockLength   = strlen($blockData);
+                    $prevBlockHash = bin2hex(strrev(substr($blockData, 4, 32)));
+                }
+                if (!$tipReached) {
+                    if ($height>=$top) {
+                        while(true) {
+                            $top=$RPC->call('getblockcount',[]);                                
+                            if ($top!==null) {break;}
+                        }
+                        if ($height-1==$top) {$tipReached=true;} // height is the next block we are waiting for
+                    }
+                }
             }
             yield [
                 'raw'         => $blockData,
@@ -588,11 +604,17 @@ function recover($full=false) { // Rewinds to a valid backup-tip
         L("Recover $postfix at height {$parseContext['height']}\n");
     
         $parseContext=unserialize(file_get_contents(DATA.$postfix));
-        $hash = $RPC->call('getblockhash', [$parseContext['height']]);
+        while (true) {
+            $hash = $RPC->call('getblockhash', [$parseContext['height']]);
+            if ($hash!==null) {break;}
+        }
         if ($hash!=$parseContext['hash']) { // rewind deeper
             if ($postfix=="_backup_1") {$postfix="_backup_2";} else {$postfix="_backup_1";}
             $parseContext=json_decode(file_get_contents(DATA.$postfix),true);
-            $hash = $RPC->call('getblockhash', [$parseContext['height']]);
+            while (true) {
+                $hash = $RPC->call('getblockhash', [$parseContext['height']]);
+                if ($hash!==null) {break;}
+            }
             if ($hash!=$parseContext['hash']) { // Oeps hoped this wouldn't occur; Both backups dont conform. Try latest Full backup
                 $parseContext=unserialize(file_get_contents(DATA."AUX"));
                 if ($hash!=$parseContext['hash']) {                    
@@ -613,8 +635,6 @@ function recover($full=false) { // Rewinds to a valid backup-tip
         load_index($TX_table,'hash',DATA."TX_hash$postfix");
         load_index($PUB_table,'hash',DATA."PUB_hash$postfix");
         
-        //PUB_table-bucket(36): [0]scripthash(20) + [1]blocknr/lastchange(4) + [2]first txo(4) + [3]last txo(4) + [4]collision-linked-list(4)
-        //TXO_table_bucket(28): [0]txin(4) + [1]nout(4) + [2]value(8) + [3]scripthash(4) + [4]txout/spend(4) + [5]scripthash-txo-linkedlist(4) 
         $truncTXOEnd  =$TXO_table['bucket'][TOP];
         $truncTXOStart=$TXO_table_backup['bucket'][TOP]+1;
         $truncPUBstart=$PUB_table_backup['bucket'][TOP]+1;
@@ -682,10 +702,10 @@ function handleSocketRequests(float $deadline){
     
     if ($server === null) {
         if (!file_exists(DATA.'rot')) {
-            $rot['auth']="";
-            for ($i=0;$i<32;$i++) {$rot['auth'].=$alphabet[mt_rand(0,57)];}
-            //$rot['candidates']=parse_peers_dat();
-            //$rot['candidateBatch']=time();
+            //$rot['auth']="";
+            //for ($i=0;$i<32;$i++) {$rot['auth'].=$alphabet[mt_rand(0,57)];}
+            ////$rot['candidates']=parse_peers_dat();
+            ////$rot['candidateBatch']=time();
         }
         $server = stream_socket_server("tcp://0.0.0.0:".SOCKET, $errno, $errstr);
         if (!$server) {die("Socket error: $errstr ($errno)");}
@@ -807,7 +827,17 @@ function handleClientRequest($request) {
     }
     $a=$cmd[1];$b=$cmd[2];
     $output="";
-    if ($a=="blk") {        
+    if ($a=="stat") {
+        $txSpace=number_format(100-100*$TX_table['bucket'][TOP]*$TX_table['bucket'][RECORDSIZE]/$TX_table['bucket'][SIZE],1,".","");
+        $pubSpace=number_format(100-100*$PUB_table['bucket'][TOP]*$PUB_table['bucket'][RECORDSIZE]/$PUB_table['bucket'][SIZE],1,".","");
+        $txoSpace=number_format(100-100*$TXO_table['bucket'][TOP]*$TXO_table['bucket'][RECORDSIZE]/$TXO_table['bucket'][SIZE],1,".","");
+        $txSize=number_format($TX_table['bucket'][SIZE],0,".","");
+        $pubSize=number_format($PUB_table['bucket'][SIZE],0,".","");
+        $txoSize=number_format($TXO_table['bucket'][SIZE],0,".","");
+        $output= "TX  size %free: $txSize $txSpace\n";
+        $output.="PUB size %free: $pubSize $pubSpace\n";
+        $output.="TXO size %free: $txoSize $txoSpace\n";
+    } elseif ($a=="blk") {        
         if (!isValidIntString($b,$height)) {
             $output="$b:$height\n";
         } else {
@@ -1102,9 +1132,9 @@ class BlockIndex { /* loads all blockhashes through RPC;
    Buffer previously loaded hashes in file blockhashes
 */
     public $hashMap = [];
-    public $tip;
     public $maxReorgDepth=100;
     public $backupHeight;
+    public $tip;
     private $batchSize=500;
     
     public function __construct() {
@@ -1163,11 +1193,22 @@ class BlockIndex { /* loads all blockhashes through RPC;
     }
     private function awaitSync(): void {        
         global $RPC;
+        $blockTip=[];
         $once=true;
         while (true) {
             $tipHash   = $RPC->call('getbestblockhash', []);
-            $tip = $RPC->call('getblock', [$tipHash]);
-            $lag       = time() - $tip['time'];
+            if ($tipHash!==null) {break;}
+        }
+        while (true) {
+            while (true) {
+                $tipHash   = $RPC->call('getbestblockhash', []);
+                if ($tipHash!==null) {break;}
+            }
+            while (true) {
+                $blockTip = $RPC->call('getblock', [$tipHash]);
+                if ($blockTip!==null) {break;}
+            }
+            $lag       = time() - $blockTip['time'];
             if ($lag < 3600) {break;} else {if ($once) {$once=false;L("Waiting for Core to sync...");}}
             sleep(60);
         }
@@ -1656,14 +1697,63 @@ function base58_encode(string $bin): string {
 class JsonRpcClient {
     private $url;
     private $id = 0;
+    private $repeat_error = 0;
+    private $last_error   = "";
 
     public function __construct(array $rpc) {
         $this->url = "http://{$rpc['user']}:{$rpc['pass']}@{$rpc['host']}:{$rpc['port']}/";
     }
-    public function call( $method, $params = []) {
-        $payload = $this->makePayload($method, $params);
-        $response = $this->sendRequest($payload);
-        return $this->handleResponse($response, $payload['id']);
+    public function call($method, $params = []) {
+        $payload = json_encode([
+            'method' => $method,
+            'params' => $params,
+            'id'     => 1
+        ]);
+
+        $ch = curl_init($this->url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POST           => true,
+            CURLOPT_HTTPHEADER     => ['Content-Type: application/json'],
+            CURLOPT_POSTFIELDS     => $payload,
+            CURLOPT_TIMEOUT        => 2,
+        ]);
+
+        $response = curl_exec($ch);
+                //    if (strpos($e->getMessage(),'"code":-8')===false) {
+                //    if (strpos($e->getMessage(),'"code":-1')===false) {
+        if ($response === false) {
+            return $this->handleError("CURL error: " . curl_error($ch));
+        }
+        $decoded = json_decode($response, true);
+        if (isset($decoded['error']) && $decoded['error'] !== null) {
+            $err = $decoded['error'];
+            if (in_array($err['code'], [-8, -1])) { // Expected "not ready yet"
+                return $err['code'];
+            }
+            return $this->handleError("RPC error: " . json_encode($decoded['error']));
+        }
+        $this->repeat_error = 0;
+        $this->last_error   = "";
+        return $decoded['result'];
+    }
+    private function handleError($msg) {
+        if ($this->last_error !== $msg) {
+            L("Caught exception: " . $msg);
+            $this->last_error   = $msg;
+            $this->repeat_error = 0;
+        } else {
+            if ($this->repeat_error < 60) {
+                $this->repeat_error++;
+            }
+            L(".");
+        }
+        if ($this->repeat_error > 10) {
+            sleep($this->repeat_error);
+        } else {
+            sleep(1);
+        }
+        return null;
     }
     public function batch(array $calls): array {
         $batch = [];
