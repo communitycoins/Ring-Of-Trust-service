@@ -80,5 +80,85 @@ You can also browse the full [Issues list](../../-/issues).
 
 Run the server:
 
+```
+#!/usr/bin/env bashbash
+php rot.php --config="/var/<ecoincore>/rot/<coin>/rot.conf" 
+```
+
+
+If no php is available we would advice installing/using docker and create a virtual php-image as such:
+
+***Dockerfile:***
+
+```Dockerfile
+FROM php:8.3-cli
+
+RUN docker-php-ext-install shmop
+```
+***bash / script:***
 ```bash
-php rot.php --config="/var/ecoincore/rot/<coin>/rot.conf"
+docker build -t cc-php-rot:8.3 .
+```
+
+and use it as such
+
+***bash / script:***
+```#!/usr/bin/env bash
+\[ -z "$1" ] \&\& { echo "Usage: $0 <coin>"; exit 2; }
+
+docker rm -f "rot-$1" >/dev/null 2>\&1 || true
+
+ECOINCORE="/var/data/communitycoins"
+
+COIN="$1"
+
+docker run -d \\
+ --name "rot-$COIN" \\
+ --network host \\
+ --log-driver=none \\
+-v "$ECOINCORE:$ECOINCORE" \\
+cc-php-rot:8.3 php \\
+ -d memory\_limit=2G \\
+ -d log\_errors=1 \\
+ -d error\_reporting=E\_ALL \\
+ -d display\_errors=1 \\
+ -d error\_log="/var/data/communitycoins/rot/rot\_$COIN.log" \\
+$ECOINCORE/rot/rot.php --config="$ECOINCORE/$COIN/rot/rot.conf"
+```
+
+If you run multiple core-wallets you might have this directory-structures
+```text
+communitycoins/
+├── rot/
+│   ├── Dockerfile
+│   ├── rot.php
+│   └── rot.sh
+├── aur/
+│   ├── blockchain/
+│   └── rot/
+│       └── rot.conf
+├── boli/
+│   ├── blockchain/
+│   └── rot/
+│       └── rot.conf
+├── cdn/
+├── cesc/
+├── dem/
+├── efl/
+├── fjc/
+├── pak/
+├── rubtc/
+├── slg/
+├── efl/
+```
+With these commands you have ease control over the ROT infrastructure:
+```bash
+# Show running spv-servers and their status
+docker ps -a --filter name='rot-' --format 'table {{.Names}}\t{{.Status}}'
+
+# start a single server
+./rot.sh efl
+
+# stop a single server
+docker stop rot-efl
+```
