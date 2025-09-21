@@ -8,7 +8,7 @@ These choices are not final and may evolve as the project matures.
 ## 1. User Experience
 
 - **Simplicity first**: Wallet users should not have to make protocol choices. Options often become obstacles.  
-- **Default trust**: Users are pointed to ROT wallets by their community; the infrastructure should work without manual intervention.  
+- **Default trust**: Users are pointed to LIGHT wallets by their community; the infrastructure should work without manual intervention.  
 
 ---
 
