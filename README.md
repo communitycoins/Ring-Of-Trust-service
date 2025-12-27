@@ -1,3 +1,6 @@
+> **Canonical source:** https://git.communitycoins.org/Rings-Of-Trust/Ring-Of-Trust-service  
+> Mirrors (GitLab/GitHub) may be read-only and may lag behind.
+
 # ROT Server
 
 This project provides the reference implementation of a **ROT (Ring of Trust)** SPV server for [CommunityCoins](https://gitlab.com/c4319/wallet).  
