@@ -37,14 +37,33 @@
   +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 */   
 
+$environment_error='';
 $options = getopt('c:h', ['config:', 'help']);
 if (isset($options['h']) || isset($options['help'])) {die("Usage: php rot.php --config=/path/to/rot.conf\n");}
-$configPath = $options['c'] ?? $options['config'] ?? getenv('ROT_CONFIG') ?? null;
-if (!$configPath) {die("Error: --config is required (or set ROT_CONFIG)\n");}
-if (!is_file($configPath)) {die("Error: config not found: $configPath\n");}
-list($tikker,$user,$ww,$rpcport,$socket,$datadir)=explode("|",trim(file_get_contents($configPath)));
+$configFile = $options['c'] ?? $options['config'] ?? getenv('ROT_CONFIG') ?? null;
+// $configPath = $options['c'] ?? $options['config'] ?? getenv('ROT_CONFIG') ?? null;
+if ($configFile) {
+    if (!is_file($configFile)) {die("Error: config not found: $configPath\n");}
+    $parts = explode('|', trim(file_get_contents($configFile)));
+    if (count($parts) !== 7) {die("Error: invalid config format (expected 7 fields)\n");}
+    [$tikker,$rpchost,$user,$ww,$rpcport,$socket,$datadir] = $parts;
+    if ($datadir && !is_dir($datadir)) {die("$datadir does not exist;\n";)
+} else {
+    $environment_error='';
+    $rpchost = getenv('CORE_RPC_HOST') ?: $environment_error.="CORE_RPC_HOST required;\n"; 
+    $rpcport  = getenv('CORE_RPC_PORT') ?: $environment_error.="CORE_RPC_PORT required;\n"; 
+    $user  = getenv('CORE_RPC_USER') ?: $environment_error.="CORE_RPC_USER required;\n";
+    $ww  = getenv('CORE_RPC_PASSWORD') ?: $environment_error.="CORE_RPC_PASSWORD required;\n";
+    $datadir  = getenv('CORE_DATA_DIR') ?: $environment_error.="CORE_DATA_DIR required;\n";
+    $socket  = getenv('ROT_LISTEN_ADDR') ?: $environment_error.="ROT_LISTEN_ADDR required;\n"; 
+    $tikker = getenv('ROT_COIN_TIKKER') ?: $environment_error.="ROT_COIN_TIKKER required;\n"; 
+    if (!file_exists($datadir)) {$environment_error.="$datadir does not exist;\n";}
+    if ($environment_error!=''){die($environment_error);}
+}
 
-define ("VERSION","0.1");
+$configPath = $datadir."/ROT";
+if (!file_exists($configPath)) {mkdir($configPath);}
+define ("VERSION","0.2");
 define("ROOT",dirname($configPath)."/");
 define("Q",ROOT."Q");
 define("A",ROOT."A");
