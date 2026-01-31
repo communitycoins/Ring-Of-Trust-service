@@ -47,7 +47,7 @@ if ($configFile) {
     $parts = explode('|', trim(file_get_contents($configFile)));
     if (count($parts) !== 7) {die("Error: invalid config format (expected 7 fields)\n");}
     [$tikker,$rpchost,$user,$ww,$rpcport,$socket,$datadir] = $parts;
-    if ($datadir && !is_dir($datadir)) {die("$datadir does not exist;\n";)
+    if ($datadir && !is_dir($datadir)) {die("$datadir does not exist;\n");}
 } else {
     $environment_error='';
     $rpchost = getenv('CORE_RPC_HOST') ?: $environment_error.="CORE_RPC_HOST required;\n"; 
