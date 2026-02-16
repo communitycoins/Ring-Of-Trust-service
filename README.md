@@ -47,7 +47,10 @@ Three articles further motivate design choices for the ROT implementation:
 
 ## Status
 
-This is the **first release (v0.1.0)**.  
+**second release (v0.2)**. 
+Accomodated to serve in a zero-touch docker compose setup (service rot:) using environment variables : [e-Gulden example](https://git.communitycoins.org/Rings-Of-Trust/e-gulden/src/branch/master/docker-compose.yml)
+
+**first release (v0.1.0)**.  
 **Early stage software** – many features are still **TODO**, and breaking changes are expected.  
 
 The main goal of this release is to:  
