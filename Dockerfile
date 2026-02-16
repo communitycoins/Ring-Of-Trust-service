@@ -1,5 +1,5 @@
 ###########################################################
-# ROT – Ring Of Trust SPV service
+# ROT - Ring Of Trust SPV service
 ###########################################################
 FROM php:8.3.2-cli-bookworm AS rot
 
