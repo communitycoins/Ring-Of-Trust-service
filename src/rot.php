@@ -853,9 +853,11 @@ function handleClientRequest($request) {
         $txSize=number_format($TX_table['bucket'][SIZE],0,".","");
         $pubSize=number_format($PUB_table['bucket'][SIZE],0,".","");
         $txoSize=number_format($TXO_table['bucket'][SIZE],0,".","");
-        $output= "TX  size %free: $txSize $txSpace\n";
-        $output.="PUB size %free: $pubSize $pubSpace\n";
-        $output.="TXO size %free: $txoSize $txoSpace\n";
+        $output="Version:".VERSION."\n";
+        $output.="Height:$height\n";
+        $output.= "TX  size %free records: $txSize $txSpace {$TX_table['bucket'][TOP]}\n";
+        $output.="PUB size %free records: $pubSize $pubSpace {$PUB_table['bucket'][TOP]}\n";
+        $output.="TXO size %free records: $txoSize $txoSpace {$TXO_table['bucket'][TOP]}\n";
     } elseif ($a=="blk") {        
         if (!isValidIntString($b,$height)) {
             $output="$b:$height\n";
