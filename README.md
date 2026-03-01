@@ -66,13 +66,13 @@ Contributions are welcome!
 
 This project is still early stage, so even small contributions make a big difference:  
 - Testing and reporting bugs.  
-- Sharing feedback on the [design considerations](./docs/considerations.md).  
+- Sharing feedback on the [design considerations](/Spv-infra/rot/docs/considerations.md).  
 - Improving documentation.  
 - Suggesting or discussing features.  
 
-Don’t hesitate — your perspective helps shape ROT into a robust, decentralized SPV layer.  
-See the [Issue Board](../../-/boards) for an overview of tasks and progress.  
-You can also browse the full [Issues list](../../-/issues).
+Don't hesitate — your perspective helps shape ROT into a robust, decentralized SPV layer.  
+See the [Issue Board](/Spv-infra/rot/boards) for an overview of tasks and progress.  
+You can also browse the full [Issues list](/Spv-infra/rot/issues).
 
 ## Requirements
 

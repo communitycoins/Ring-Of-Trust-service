@@ -16,7 +16,7 @@ The **Ring of Trust (ROT)** did not arise in a vacuum. It is a response to sever
 ## Limited Availability of SPV Nodes
 
 - The number of publicly available and reliable ElectrumX, Fulcrum, and Electrs nodes is very limited.
-- A service like **bitcoin-eye** is currently essential for SPV peer discovery.  
+- A service like [**bitcoin-eye**](https://1209k.com/bitcoin-eye/ele.php) is currently essential for SPV peer discovery.  
 - This scarcity makes wallets fragile: if a few nodes fail or misbehave, users lose reliable access.  
 - To maintain a stable wallet service, the SPV layer itself must be **stable and discoverable**. 
 - A **multicoin light wallet** depends on a stronger backbone than the current scattered set of public servers.  
