@@ -109,8 +109,9 @@ docker build -t cc-php-rot:8.3 .
 and use it as such
 
 ***bash / script:***
-```#!/usr/bin/env bash
-\[ -z "$1" ] \&\& { echo "Usage: $0 <coin>"; exit 2; }
+```
+#!/usr/bin/env bash
+[ -z "$1" ] \&\& { echo "Usage: $0 <coin>"; exit 2; }
 
 docker rm -f "rot-$1" >/dev/null 2>\&1 || true
 
