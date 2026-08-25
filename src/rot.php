@@ -1,4 +1,17 @@
 <?php
+/* [EFL-SLICE-026]
+ROT legacy wallet-state and raw-transaction broadcast service.
+Base: - Derived from EFL-SLICE-015 ROT version 0.3
+Changes:
+- [EFL-SLICE-026] Add bounded send and txstatus client commands.
+- Pass raw transactions to Core without constructing or signing them in ROT.
+- Return immediate structured Core acceptance, rejection and technical outcomes.
+- Calculate the transaction id independently and expose Core and ROT timings.
+- [EFL-SLICE-015] Add a generic pubs command for one consistent multi-address snapshot.
+- Return aggregate balance, per-address UTXOs and the indexed chain checkpoint as JSON.
+- Reject invalid-network, duplicate, empty and oversized address collections.
+- Keep the existing diagnostic commands unchanged and use PHP 7.3-compatible callbacks.
+*/
 
 /* Its purpose is to build a full legacy blockindex
  
@@ -63,7 +76,9 @@ if ($configFile) {
 
 $configPath = $datadir."/ROT";
 if (!file_exists($configPath)) {mkdir($configPath);}
-define ("VERSION","0.2");
+define ("VERSION","0.4");
+define ("MAX_PUBS",32);
+define ("MAX_RAW_TRANSACTION_HEX",4096);
 define("ROOT",dirname($configPath)."/");
 define("Q",ROOT."Q");
 define("A",ROOT."A");
@@ -766,7 +781,7 @@ function handleSocketRequests(float $deadline){
                 if ($meta['timed_out'] || $line === false || feof($sock)) {
                     fclose($sock);
                     if (DEBUG) {echo "socket issue...\n";}
-                    $clients = array_filter($clients, fn($c) => $c !== $sock);
+                    $clients = array_filter($clients, function($clientSocket) use ($sock) {return $clientSocket !== $sock;});
                 } else {
                     if (DEBUG) {echo "$line\n";}
                     $response = handleClientRequest($line);
@@ -774,7 +789,7 @@ function handleSocketRequests(float $deadline){
                     fflush($sock);
                     fclose($sock);
                     if (DEBUG) {echo "$response\n";}
-                    $clients = array_filter($clients, fn($c) => $c !== $sock);
+                    $clients = array_filter($clients, function($clientSocket) use ($sock) {return $clientSocket !== $sock;});
                 }
             }
         }
@@ -836,6 +851,206 @@ function parse_peers_dat() {
     return $peers;
 }
 
+function encodePubsResponse(array $response) {
+    $json=json_encode($response,JSON_UNESCAPED_SLASHES);
+    if ($json===false) {
+        return '{"ok":false,"error":"JSON_ENCODE_FAILED"}';
+    }
+    return $json;
+}
+function pubsError($id,$error) {
+    return encodePubsResponse([
+        'ok'=>false,
+        'id'=>$id,
+        'error'=>$error
+    ]);
+}
+function transactionIdFromRaw($rawHex) {
+    $binary=hex2bin($rawHex);
+    if ($binary===false) {
+        return false;
+    }
+    return bin2hex(strrev(hash('sha256',hash('sha256',$binary,true),true)));
+}
+function sendResponse($id,$ok,$status,$txid,$fields=[]) {
+    global $tikker;
+
+    $response=[
+        'ok'=>$ok,
+        'id'=>$id,
+        'coin'=>$tikker,
+        'technical'=>false,
+        'status'=>$status,
+        'txid'=>$txid
+    ];
+    foreach ($fields as $key=>$value) {
+        $response[$key]=$value;
+    }
+    return encodePubsResponse($response);
+}
+function handleSendRequest($id,$rawHex) {
+    global $RPC;
+
+    $started=microtime(true);
+    if (!is_string($id) || $id==='' || strlen($id)>64) {
+        return sendResponse($id,false,'REJECTED',null,['error'=>'INVALID_ID','rotMs'=>(int)round((microtime(true)-$started)*1000)]);
+    }
+    if (!is_string($rawHex) || strlen($rawHex)<20 || strlen($rawHex)>MAX_RAW_TRANSACTION_HEX || (strlen($rawHex)%2)!==0 || !ctype_xdigit($rawHex)) {
+        return sendResponse($id,false,'REJECTED',null,['error'=>'INVALID_RAW_TRANSACTION','rotMs'=>(int)round((microtime(true)-$started)*1000)]);
+    }
+
+    $rawHex=strtolower($rawHex);
+    $localTxid=transactionIdFromRaw($rawHex);
+    if ($localTxid===false) {
+        return sendResponse($id,false,'REJECTED',null,['error'=>'INVALID_RAW_TRANSACTION','rotMs'=>(int)round((microtime(true)-$started)*1000)]);
+    }
+
+    $core=$RPC->callResult('sendrawtransaction',[$rawHex]);
+    $timing=['coreMs'=>$core['durationMs'],'rotMs'=>(int)round((microtime(true)-$started)*1000)];
+    if ($core['technical']) {
+        return sendResponse($id,false,'UNAVAILABLE',$localTxid,array_merge($timing,['technical'=>true,'error'=>$core['error']]));
+    }
+    if (!$core['ok']) {
+        $message=(string)$core['rpcMessage'];
+        $alreadyKnown=($core['rpcCode']===-27)||preg_match('/already/i',$message);
+        if ($alreadyKnown) {
+            return sendResponse($id,true,'KNOWN',$localTxid,array_merge($timing,['accepted'=>true]));
+        }
+        return sendResponse($id,false,'REJECTED',$localTxid,array_merge($timing,[
+            'accepted'=>false,
+            'rpcCode'=>$core['rpcCode'],
+            'rpcMessage'=>$message
+        ]));
+    }
+
+    $coreTxid=is_string($core['result'])?strtolower($core['result']):'';
+    if (!preg_match('/^[0-9a-f]{64}$/',$coreTxid) || !hash_equals($localTxid,$coreTxid)) {
+        return sendResponse($id,false,'UNAVAILABLE',$localTxid,array_merge($timing,['technical'=>true,'error'=>'CORE_TXID_MISMATCH']));
+    }
+    return sendResponse($id,true,'ACCEPTED',$localTxid,array_merge($timing,['accepted'=>true]));
+}
+function handleTransactionStatusRequest($id,$txid) {
+    global $RPC,$height,$lastBlockHash,$TX_table;
+
+    $started=microtime(true);
+    if (!is_string($id) || $id==='' || strlen($id)>64 || !is_string($txid) || !preg_match('/^[0-9a-fA-F]{64}$/',$txid)) {
+        return sendResponse($id,false,'REJECTED',null,['error'=>'INVALID_TRANSACTION_ID','rotMs'=>(int)round((microtime(true)-$started)*1000)]);
+    }
+    $txid=strtolower($txid);
+    list($index,$record)=find($TX_table,hex2bin($txid));
+    if ($index!==false && isset($record[0]) && bin2hex($record[0])===$txid) {
+        $blockHeight=(int)$record[1];
+        return sendResponse($id,true,'CONFIRMED',$txid,[
+            'confirmed'=>true,
+            'blockHeight'=>$blockHeight,
+            'confirmations'=>max(1,$height-$blockHeight),
+            'height'=>max(0,$height-1),
+            'blockHash'=>$lastBlockHash,
+            'coreMs'=>0,
+            'rotMs'=>(int)round((microtime(true)-$started)*1000)
+        ]);
+    }
+
+    $core=$RPC->callResult('getrawmempool',[]);
+    $timing=['coreMs'=>$core['durationMs'],'rotMs'=>(int)round((microtime(true)-$started)*1000)];
+    if ($core['technical'] || !$core['ok'] || !is_array($core['result'])) {
+        return sendResponse($id,false,'UNAVAILABLE',$txid,array_merge($timing,['technical'=>true,'error'=>'CORE_STATUS_UNAVAILABLE']));
+    }
+    if (in_array($txid,$core['result'],true)) {
+        return sendResponse($id,true,'MEMPOOL',$txid,array_merge($timing,['confirmed'=>false]));
+    }
+    return sendResponse($id,true,'UNKNOWN',$txid,array_merge($timing,['confirmed'=>false]));
+}
+function handlePubsRequest($id,$params) {
+    global $height,$lastBlockHash,$TX_table,$TXO_table,$PUB_table,$versionByte,$tikker;
+
+    if (!is_string($id) || $id==='' || strlen($id)>64) {
+        return pubsError($id,'INVALID_ID');
+    }
+
+    $parts=explode(',',$params);
+    if (count($parts)<1 || count($parts)>MAX_PUBS) {
+        return pubsError($id,'INVALID_ADDRESS_COUNT');
+    }
+
+    $addresses=[];
+    $seen=[];
+    foreach ($parts as $part) {
+        $address=trim($part);
+        if ($address==='' || isset($seen[$address])) {
+            return pubsError($id,'INVALID_ADDRESS_SET');
+        }
+
+        $payload=base58check_decode($address);
+        if ($payload===false || strlen($payload)!==21 || ord($payload[0])!==$versionByte) {
+            return pubsError($id,'INVALID_COIN_ADDRESS');
+        }
+
+        $seen[$address]=true;
+        $addresses[]=[
+            'address'=>$address,
+            'pubkeyhash'=>substr($payload,1,20)
+        ];
+    }
+
+    $indexedHeight=max(0,$height-1);
+    $totalBalance=0;
+    $addressStates=[];
+
+    foreach ($addresses as $item) {
+        $address=$item['address'];
+        $pubkeyhash=$item['pubkeyhash'];
+        $addressBalance=0;
+        $utxos=[];
+        $lastChangeHeight=null;
+
+        list($index,$record)=find($PUB_table,$pubkeyhash);
+        if ($index!==false && isset($record[0]) && $record[0]===$pubkeyhash) {
+            $lastChangeHeight=$record[1];
+            $txo=hashtable_read($TXO_table['bucket'],$record[2]);
+            while (isset($txo[3]) && $txo[3]===$index) {
+                if ($txo[4]===0) {
+                    $tx=hashtable_read($TX_table['bucket'],$txo[0]);
+                    $value=(int)$txo[2];
+                    $blockHeight=(int)$tx[1];
+                    $utxos[]=[
+                        'txid'=>bin2hex($tx[0]),
+                        'vout'=>(int)$txo[1],
+                        'value'=>$value,
+                        'height'=>$blockHeight,
+                        'confirmations'=>max(1,$height-$blockHeight),
+                        'scriptPubKey'=>'76a914'.bin2hex($pubkeyhash).'88ac'
+                    ];
+                    $addressBalance+=$value;
+                }
+
+                if ($txo[5]!==0) {
+                    $txo=hashtable_read($TXO_table['bucket'],$txo[5]);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        $totalBalance+=$addressBalance;
+        $addressStates[]=[
+            'address'=>$address,
+            'lastChangeHeight'=>$lastChangeHeight,
+            'balance'=>$addressBalance,
+            'utxos'=>$utxos
+        ];
+    }
+
+    return encodePubsResponse([
+        'ok'=>true,
+        'id'=>$id,
+        'coin'=>$tikker,
+        'height'=>$indexedHeight,
+        'blockHash'=>$lastBlockHash,
+        'balance'=>$totalBalance,
+        'addresses'=>$addressStates
+    ]);
+}
 function handleClientRequest($request) {
     global $height,$TX_table,$TXO_table,$PUB_table,$versionByte;
     
@@ -977,6 +1192,12 @@ function handleClientRequest($request) {
             }
         }
         $output.= "(".(microtime(true)-$start).")\n\n";            
+    } elseif ($a=="send"){
+        return handleSendRequest($cmd[0],$b);
+    } elseif ($a=="txstatus"){
+        return handleTransactionStatusRequest($cmd[0],$b);
+    } elseif ($a=="pubs"){
+        return handlePubsRequest($cmd[0],$b);
     } elseif ($a=="pub"){
         $payload=base58check_decode($b);
         if ($payload) {
@@ -1757,6 +1978,55 @@ class JsonRpcClient {
         $this->repeat_error = 0;
         $this->last_error   = "";
         return $decoded['result'];
+    }
+    public function callResult($method,$params=[]) {
+        $started=microtime(true);
+        $payload=json_encode([
+            'method'=>$method,
+            'params'=>$params,
+            'id'=>1
+        ]);
+        if ($payload===false) {
+            return ['technical'=>true,'ok'=>false,'error'=>'CORE_REQUEST_ENCODE_FAILED','durationMs'=>0];
+        }
+
+        $ch=curl_init($this->url);
+        curl_setopt_array($ch,[
+            CURLOPT_RETURNTRANSFER=>true,
+            CURLOPT_POST=>true,
+            CURLOPT_HTTPHEADER=>['Content-Type: application/json'],
+            CURLOPT_POSTFIELDS=>$payload,
+            CURLOPT_CONNECTTIMEOUT=>2,
+            CURLOPT_TIMEOUT=>6
+        ]);
+        $response=curl_exec($ch);
+        $httpCode=(int)curl_getinfo($ch,CURLINFO_HTTP_CODE);
+        if ($response===false) {
+            curl_close($ch);
+            return ['technical'=>true,'ok'=>false,'error'=>'CORE_RPC_UNAVAILABLE','durationMs'=>(int)round((microtime(true)-$started)*1000)];
+        }
+        curl_close($ch);
+
+        $decoded=json_decode($response,true);
+        $durationMs=(int)round((microtime(true)-$started)*1000);
+        if (!is_array($decoded) || (!array_key_exists('result',$decoded) && !array_key_exists('error',$decoded))) {
+            return ['technical'=>true,'ok'=>false,'error'=>'INVALID_CORE_RESPONSE','durationMs'=>$durationMs];
+        }
+        if ($httpCode!==0 && $httpCode!==200 && $httpCode!==500) {
+            return ['technical'=>true,'ok'=>false,'error'=>'CORE_HTTP_ERROR','durationMs'=>$durationMs];
+        }
+        if (isset($decoded['error']) && $decoded['error']!==null) {
+            $rpcCode=isset($decoded['error']['code'])?(int)$decoded['error']['code']:0;
+            $rpcMessage=isset($decoded['error']['message'])?(string)$decoded['error']['message']:'Core rejected the request';
+            if ($rpcCode===-28) {
+                return ['technical'=>true,'ok'=>false,'error'=>'CORE_NOT_READY','durationMs'=>$durationMs];
+            }
+            return ['technical'=>false,'ok'=>false,'rpcCode'=>$rpcCode,'rpcMessage'=>substr($rpcMessage,0,512),'durationMs'=>$durationMs];
+        }
+        if ($httpCode!==0 && $httpCode!==200) {
+            return ['technical'=>true,'ok'=>false,'error'=>'CORE_HTTP_ERROR','durationMs'=>$durationMs];
+        }
+        return ['technical'=>false,'ok'=>true,'result'=>$decoded['result'],'durationMs'=>$durationMs];
     }
     private function handleError($msg) {
         if ($this->last_error !== $msg) {
