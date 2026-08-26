@@ -1,8 +1,11 @@
 <?php
-/* [EFL-SLICE-026]
-ROT legacy wallet-state and raw-transaction broadcast service.
-Base: - Derived from EFL-SLICE-015 ROT version 0.3
+/* [EFL-SLICE-028]
+ROT legacy wallet-state service with optional per-address delta responses.
+Base: - Derived from EFL-SLICE-026 ROT version 0.4
 Changes:
+- [EFL-SLICE-028] Extend pubs with optional known height and per-address change heights
+- Return only changed address records while retaining the live chain checkpoint
+- Avoid walking unchanged PUB-linked TXO lists and leave delta aggregation to the wallet
 - [EFL-SLICE-026] Add bounded send and txstatus client commands.
 - Pass raw transactions to Core without constructing or signing them in ROT.
 - Return immediate structured Core acceptance, rejection and technical outcomes.
@@ -76,7 +79,7 @@ if ($configFile) {
 
 $configPath = $datadir."/ROT";
 if (!file_exists($configPath)) {mkdir($configPath);}
-define ("VERSION","0.4");
+define ("VERSION","0.5");
 define ("MAX_PUBS",32);
 define ("MAX_RAW_TRANSACTION_HEX",4096);
 define("ROOT",dirname($configPath)."/");
@@ -961,14 +964,98 @@ function handleTransactionStatusRequest($id,$txid) {
     }
     return sendResponse($id,true,'UNKNOWN',$txid,array_merge($timing,['confirmed'=>false]));
 }
+function parseUnsignedHeight($value,&$parsed) {
+    if (!is_string($value) || strlen($value)>10 || !preg_match('/^(0|[1-9][0-9]*)$/',$value)) {
+        return false;
+    }
+    $parsed=(int)$value;
+    return $parsed>=0 && (string)$parsed===$value;
+}
+function parsePubsParameters($params,&$parts,&$knownHeight,&$knownChanges,&$error) {
+    $sections=explode(';',$params);
+    $knownHeight=null;
+    $knownChanges=null;
+    if (count($sections)===1) {
+        $parts=explode(',',$sections[0]);
+        return true;
+    }
+    if (count($sections)!==3 || !parseUnsignedHeight($sections[0],$knownHeight)) {
+        $error='INVALID_KNOWN_STATE';
+        return false;
+    }
+    $parts=explode(',',$sections[1]);
+    $markers=explode(',',$sections[2]);
+    if (count($markers)!==count($parts)) {
+        $error='INVALID_CHANGE_HEIGHTS';
+        return false;
+    }
+    $knownChanges=[];
+    foreach ($markers as $marker) {
+        if ($marker==='-') {
+            $knownChanges[]=null;
+            continue;
+        }
+        $changeHeight=0;
+        if (!parseUnsignedHeight($marker,$changeHeight) || $changeHeight>$knownHeight) {
+            $error='INVALID_CHANGE_HEIGHTS';
+            return false;
+        }
+        $knownChanges[]=$changeHeight;
+    }
+    return true;
+}
+function readPubsAddressState($address,$pubkeyhash,$index,array $record) {
+    global $height,$TX_table,$TXO_table;
+
+    $addressBalance=0;
+    $utxos=[];
+    $lastChangeHeight=null;
+    if ($index!==false && isset($record[0]) && $record[0]===$pubkeyhash) {
+        $lastChangeHeight=(int)$record[1];
+        $txo=hashtable_read($TXO_table['bucket'],$record[2]);
+        while (isset($txo[3]) && $txo[3]===$index) {
+            if ($txo[4]===0) {
+                $tx=hashtable_read($TX_table['bucket'],$txo[0]);
+                $value=(int)$txo[2];
+                $blockHeight=(int)$tx[1];
+                $utxos[]=[
+                    'txid'=>bin2hex($tx[0]),
+                    'vout'=>(int)$txo[1],
+                    'value'=>$value,
+                    'height'=>$blockHeight,
+                    'confirmations'=>max(1,$height-$blockHeight),
+                    'scriptPubKey'=>'76a914'.bin2hex($pubkeyhash).'88ac'
+                ];
+                $addressBalance+=$value;
+            }
+            if ($txo[5]!==0) {
+                $txo=hashtable_read($TXO_table['bucket'],$txo[5]);
+            } else {
+                break;
+            }
+        }
+    }
+    return [
+        'address'=>$address,
+        'lastChangeHeight'=>$lastChangeHeight,
+        'balance'=>$addressBalance,
+        'utxos'=>$utxos
+    ];
+}
 function handlePubsRequest($id,$params) {
-    global $height,$lastBlockHash,$TX_table,$TXO_table,$PUB_table,$versionByte,$tikker;
+    global $height,$lastBlockHash,$PUB_table,$versionByte,$tikker;
 
     if (!is_string($id) || $id==='' || strlen($id)>64) {
         return pubsError($id,'INVALID_ID');
     }
 
-    $parts=explode(',',$params);
+    $parts=[];
+    $knownHeight=null;
+    $knownChanges=null;
+    $error='';
+    if (!parsePubsParameters($params,$parts,$knownHeight,$knownChanges,$error)) {
+        return pubsError($id,$error);
+    }
     if (count($parts)<1 || count($parts)>MAX_PUBS) {
         return pubsError($id,'INVALID_ADDRESS_COUNT');
     }
@@ -980,12 +1067,10 @@ function handlePubsRequest($id,$params) {
         if ($address==='' || isset($seen[$address])) {
             return pubsError($id,'INVALID_ADDRESS_SET');
         }
-
         $payload=base58check_decode($address);
         if ($payload===false || strlen($payload)!==21 || ord($payload[0])!==$versionByte) {
             return pubsError($id,'INVALID_COIN_ADDRESS');
         }
-
         $seen[$address]=true;
         $addresses[]=[
             'address'=>$address,
@@ -994,62 +1079,41 @@ function handlePubsRequest($id,$params) {
     }
 
     $indexedHeight=max(0,$height-1);
-    $totalBalance=0;
-    $addressStates=[];
-
-    foreach ($addresses as $item) {
-        $address=$item['address'];
-        $pubkeyhash=$item['pubkeyhash'];
-        $addressBalance=0;
-        $utxos=[];
-        $lastChangeHeight=null;
-
-        list($index,$record)=find($PUB_table,$pubkeyhash);
-        if ($index!==false && isset($record[0]) && $record[0]===$pubkeyhash) {
-            $lastChangeHeight=$record[1];
-            $txo=hashtable_read($TXO_table['bucket'],$record[2]);
-            while (isset($txo[3]) && $txo[3]===$index) {
-                if ($txo[4]===0) {
-                    $tx=hashtable_read($TX_table['bucket'],$txo[0]);
-                    $value=(int)$txo[2];
-                    $blockHeight=(int)$tx[1];
-                    $utxos[]=[
-                        'txid'=>bin2hex($tx[0]),
-                        'vout'=>(int)$txo[1],
-                        'value'=>$value,
-                        'height'=>$blockHeight,
-                        'confirmations'=>max(1,$height-$blockHeight),
-                        'scriptPubKey'=>'76a914'.bin2hex($pubkeyhash).'88ac'
-                    ];
-                    $addressBalance+=$value;
-                }
-
-                if ($txo[5]!==0) {
-                    $txo=hashtable_read($TXO_table['bucket'],$txo[5]);
-                } else {
-                    break;
-                }
-            }
-        }
-
-        $totalBalance+=$addressBalance;
-        $addressStates[]=[
-            'address'=>$address,
-            'lastChangeHeight'=>$lastChangeHeight,
-            'balance'=>$addressBalance,
-            'utxos'=>$utxos
-        ];
+    $delta=is_array($knownChanges);
+    if ($delta && $indexedHeight<$knownHeight) {
+        return pubsError($id,'STATE_BEHIND');
     }
 
-    return encodePubsResponse([
+    $totalBalance=0;
+    $addressStates=[];
+    foreach ($addresses as $position=>$item) {
+        $address=$item['address'];
+        $pubkeyhash=$item['pubkeyhash'];
+        list($index,$record)=find($PUB_table,$pubkeyhash);
+        $lastChangeHeight=($index!==false && isset($record[0]) && $record[0]===$pubkeyhash)?(int)$record[1]:null;
+        if ($delta && $knownChanges[$position]===$lastChangeHeight) {
+            continue;
+        }
+        $addressState=readPubsAddressState($address,$pubkeyhash,$index,$record);
+        $addressStates[]=$addressState;
+        if (!$delta) {
+            $totalBalance+=$addressState['balance'];
+        }
+    }
+
+    $response=[
         'ok'=>true,
         'id'=>$id,
         'coin'=>$tikker,
+        'mode'=>$delta?'delta':'full',
         'height'=>$indexedHeight,
         'blockHash'=>$lastBlockHash,
-        'balance'=>$totalBalance,
         'addresses'=>$addressStates
-    ]);
+    ];
+    if (!$delta) {
+        $response['balance']=$totalBalance;
+    }
+    return encodePubsResponse($response);
 }
 function handleClientRequest($request) {
     global $height,$TX_table,$TXO_table,$PUB_table,$versionByte;
