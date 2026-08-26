@@ -1,8 +1,10 @@
 <?php
-/* [EFL-SLICE-028]
-ROT legacy wallet-state service with optional per-address delta responses.
-Base: - Derived from EFL-SLICE-026 ROT version 0.4
+/* [EFL-SLICE-032]
+ROT legacy wallet-state and transaction service for the expanded EFL-SLICE wallet.
+Base: - Derived from EFL-SLICE-028 ROT version 0.4
 Changes:
+- [EFL-SLICE-032] Accept larger raw transactions produced by multi-tier legacy-input selection
+- [EFL-SLICE-031] Raise the atomic pubs snapshot from 32 to 51 addresses
 - [EFL-SLICE-028] Extend pubs with optional known height and per-address change heights
 - Return only changed address records while retaining the live chain checkpoint
 - Avoid walking unchanged PUB-linked TXO lists and leave delta aggregation to the wallet
@@ -80,8 +82,8 @@ if ($configFile) {
 $configPath = $datadir."/ROT";
 if (!file_exists($configPath)) {mkdir($configPath);}
 define ("VERSION","0.5");
-define ("MAX_PUBS",32);
-define ("MAX_RAW_TRANSACTION_HEX",4096);
+define ("MAX_PUBS",51);
+define ("MAX_RAW_TRANSACTION_HEX",65000);
 define("ROOT",dirname($configPath)."/");
 define("Q",ROOT."Q");
 define("A",ROOT."A");
