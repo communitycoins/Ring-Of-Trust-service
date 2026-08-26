@@ -1,8 +1,9 @@
 <?php
-/* [EFL-SLICE-032]
-ROT legacy wallet-state and transaction service for the expanded EFL-SLICE wallet.
-Base: - Derived from EFL-SLICE-028 ROT version 0.4
+/* [EFL-SLICE-033]
+ROT legacy wallet-state and transaction service with exact mempool-output observation.
+Base: - Derived from EFL-SLICE-032 ROT version 0.4
 Changes:
+- [EFL-SLICE-033] Verify a known mempool txid against one exact legacy address and satoshi amount
 - [EFL-SLICE-032] Accept larger raw transactions produced by multi-tier legacy-input selection
 - [EFL-SLICE-031] Raise the atomic pubs snapshot from 32 to 51 addresses
 - [EFL-SLICE-028] Extend pubs with optional known height and per-address change heights
@@ -966,6 +967,107 @@ function handleTransactionStatusRequest($id,$txid) {
     }
     return sendResponse($id,true,'UNKNOWN',$txid,array_merge($timing,['confirmed'=>false]));
 }
+function coinValueToSats($value) {
+    if (!is_int($value) && !is_float($value) && !is_string($value)) {
+        return false;
+    }
+    if (is_string($value) && !preg_match('/^(0|[1-9][0-9]*)(\.[0-9]{1,8})?$/',$value)) {
+        return false;
+    }
+    $decimal=is_string($value)?$value:number_format($value,8,'.','');
+    $parts=explode('.',$decimal,2);
+    $whole=$parts[0];
+    $fraction=isset($parts[1])?str_pad($parts[1],8,'0'):str_repeat('0',8);
+    if (strlen($fraction)>8 || strlen($whole)>10) {
+        return false;
+    }
+    $sats=((int)$whole)*100000000+(int)$fraction;
+    return $sats>=0?$sats:false;
+}
+function handleZeroConfirmationRequest($id,$parameters) {
+    global $RPC,$height,$lastBlockHash,$TX_table,$TXO_table,$PUB_table,$versionByte;
+
+    $started=microtime(true);
+    $parts=explode(',',$parameters);
+    if (!is_string($id) || $id==='' || strlen($id)>64 || count($parts)!==3) {
+        return sendResponse($id,false,'REJECTED',null,['address'=>'','amountSats'=>0,'error'=>'INVALID_PAYMENT_RECEIPT','rotMs'=>(int)round((microtime(true)-$started)*1000)]);
+    }
+    list($txid,$address,$amountText)=$parts;
+    $payload=base58check_decode($address);
+    if (!preg_match('/^[0-9a-fA-F]{64}$/',$txid) || $payload===false || strlen($payload)!==21 || ord($payload[0])!==$versionByte || !preg_match('/^[1-9][0-9]*$/',$amountText)) {
+        return sendResponse($id,false,'REJECTED',preg_match('/^[0-9a-fA-F]{64}$/',$txid)?strtolower($txid):null,['address'=>$address,'amountSats'=>(int)$amountText,'error'=>'INVALID_PAYMENT_RECEIPT','rotMs'=>(int)round((microtime(true)-$started)*1000)]);
+    }
+    $txid=strtolower($txid);
+    $amountSats=(int)$amountText;
+    if ($amountSats<=0) {
+        return sendResponse($id,false,'REJECTED',$txid,['address'=>$address,'amountSats'=>$amountSats,'error'=>'INVALID_PAYMENT_RECEIPT','rotMs'=>(int)round((microtime(true)-$started)*1000)]);
+    }
+
+    list($index,$record)=find($TX_table,hex2bin($txid));
+    if ($index!==false && isset($record[0]) && bin2hex($record[0])===$txid) {
+        $blockHeight=(int)$record[1];
+        $matched=false;
+        $offset=0;
+        while ($record[2]+$offset<=$TXO_table['bucket'][TOP]) {
+            $txo=hashtable_read($TXO_table['bucket'],$record[2]+$offset);
+            if ($txo[0]!==$index) {break;}
+            $pub=hashtable_read($PUB_table['bucket'],$txo[3]);
+            if (address_from_pubkeyhash($pub[0])===$address && (int)$txo[2]===$amountSats) {$matched=true;break;}
+            $offset++;
+        }
+        if (!$matched) {
+            return sendResponse($id,false,'OUTPUT_MISMATCH',$txid,[
+                'address'=>$address,
+                'amountSats'=>$amountSats,
+                'confirmed'=>true,
+                'blockHeight'=>$blockHeight,
+                'confirmations'=>max(1,$height-$blockHeight),
+                'height'=>max(0,$height-1),
+                'blockHash'=>$lastBlockHash,
+                'coreMs'=>0,
+                'rotMs'=>(int)round((microtime(true)-$started)*1000)
+            ]);
+        }
+        return sendResponse($id,true,'CONFIRMED',$txid,[
+            'address'=>$address,
+            'amountSats'=>$amountSats,
+            'confirmed'=>true,
+            'blockHeight'=>$blockHeight,
+            'confirmations'=>max(1,$height-$blockHeight),
+            'height'=>max(0,$height-1),
+            'blockHash'=>$lastBlockHash,
+            'coreMs'=>0,
+            'rotMs'=>(int)round((microtime(true)-$started)*1000)
+        ]);
+    }
+
+    $mempool=$RPC->callResult('getrawmempool',[]);
+    if ($mempool['technical'] || !$mempool['ok'] || !is_array($mempool['result'])) {
+        return sendResponse($id,false,'UNAVAILABLE',$txid,['technical'=>true,'address'=>$address,'amountSats'=>$amountSats,'error'=>'CORE_MEMPOOL_UNAVAILABLE','coreMs'=>$mempool['durationMs'],'rotMs'=>(int)round((microtime(true)-$started)*1000)]);
+    }
+    if (!in_array($txid,$mempool['result'],true)) {
+        return sendResponse($id,true,'NOT_SEEN',$txid,['address'=>$address,'amountSats'=>$amountSats,'confirmed'=>false,'coreMs'=>$mempool['durationMs'],'rotMs'=>(int)round((microtime(true)-$started)*1000)]);
+    }
+
+    $decoded=$RPC->callResult('getrawtransaction',[$txid,true]);
+    $coreMs=$mempool['durationMs']+$decoded['durationMs'];
+    if ($decoded['technical'] || !$decoded['ok'] || !is_array($decoded['result']) || !isset($decoded['result']['txid']) || strtolower((string)$decoded['result']['txid'])!==$txid || !isset($decoded['result']['vout']) || !is_array($decoded['result']['vout'])) {
+        return sendResponse($id,false,'UNAVAILABLE',$txid,['technical'=>true,'address'=>$address,'amountSats'=>$amountSats,'error'=>'CORE_TRANSACTION_UNAVAILABLE','coreMs'=>$coreMs,'rotMs'=>(int)round((microtime(true)-$started)*1000)]);
+    }
+    $matched=false;
+    foreach ($decoded['result']['vout'] as $output) {
+        if (!is_array($output) || !array_key_exists('value',$output) || !isset($output['scriptPubKey']['hex'])) {continue;}
+        $scriptHex=strtolower((string)$output['scriptPubKey']['hex']);
+        if (!preg_match('/^76a914([0-9a-f]{40})88ac$/',$scriptHex,$matches)) {continue;}
+        $outputAddress=address_from_pubkeyhash(hex2bin($matches[1]));
+        $outputSats=coinValueToSats($output['value']);
+        if ($outputAddress===$address && $outputSats===$amountSats) {$matched=true;break;}
+    }
+    if (!$matched) {
+        return sendResponse($id,false,'OUTPUT_MISMATCH',$txid,['address'=>$address,'amountSats'=>$amountSats,'confirmed'=>false,'coreMs'=>$coreMs,'rotMs'=>(int)round((microtime(true)-$started)*1000)]);
+    }
+    return sendResponse($id,true,'SEEN',$txid,['address'=>$address,'amountSats'=>$amountSats,'confirmed'=>false,'coreMs'=>$coreMs,'rotMs'=>(int)round((microtime(true)-$started)*1000)]);
+}
 function parseUnsignedHeight($value,&$parsed) {
     if (!is_string($value) || strlen($value)>10 || !preg_match('/^(0|[1-9][0-9]*)$/',$value)) {
         return false;
@@ -1262,6 +1364,8 @@ function handleClientRequest($request) {
         return handleSendRequest($cmd[0],$b);
     } elseif ($a=="txstatus"){
         return handleTransactionStatusRequest($cmd[0],$b);
+    } elseif ($a=="zeroconf"){
+        return handleZeroConfirmationRequest($cmd[0],$b);
     } elseif ($a=="pubs"){
         return handlePubsRequest($cmd[0],$b);
     } elseif ($a=="pub"){
