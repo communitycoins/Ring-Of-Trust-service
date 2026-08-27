@@ -1,8 +1,13 @@
 <?php
-/* [EFL-SLICE-033]
-ROT legacy wallet-state and transaction service with exact mempool-output observation.
-Base: - Derived from EFL-SLICE-032 ROT version 0.4
+/* [EFL-SLICE-034]
+ROT restart and orphan-rewind integrity repair with duplicate financial-index guards.
+Base: - Derived from EFL-SLICE-033
 Changes:
+- [EFL-SLICE-034] Bind every full and rolling backup to the exact indexed height, hash and table tops
+- Select the highest canonical rewind checkpoint instead of trusting file modification order
+- Restore orphaned spend markers, PUB last-change heights and TXO list tails during rewind
+- Stop indexing when an existing transaction id would be appended again
+- Reject cyclic, invalid or duplicate outpoints while constructing wallet state
 - [EFL-SLICE-033] Verify a known mempool txid against one exact legacy address and satoshi amount
 - [EFL-SLICE-032] Accept larger raw transactions produced by multi-tier legacy-input selection
 - [EFL-SLICE-031] Raise the atomic pubs snapshot from 32 to 51 addresses
@@ -82,7 +87,7 @@ if ($configFile) {
 
 $configPath = $datadir."/ROT";
 if (!file_exists($configPath)) {mkdir($configPath);}
-define ("VERSION","0.5");
+define ("VERSION","0.6");
 define ("MAX_PUBS",51);
 define ("MAX_RAW_TRANSACTION_HEX",65000);
 define("ROOT",dirname($configPath)."/");
@@ -159,24 +164,17 @@ $TXidx="";$TXdata="";$TX_sum=0;$BLKidx="";
 
 $recovery=false;
 if (file_exists(DATA."AUX")){ // Recover...
-    $parseContext=unserialize(file_get_contents(DATA."AUX"));
-    while (true) {
-        $hash = $RPC->call('getblockhash', [$parseContext['height']]);
-        if ($hash!==null) {break;}
-    }
-    if ($hash==$parseContext['hash']) { 
-        L("Recovering ...");
-        recover(true);
+    L("Recovering ...");
+    if (recover(true)) {
         $height=$parseContext['height']+1; // Next height to look for
+        $lastBlockHash=$parseContext['hash'];
         $recovery=true;
     } else {
-        L("Failover hash doesn't match core's vision \nRestarting ...\n");
-        $recovery=false;
+        L("Full backup is incomplete or does not match core's vision \nRestarting ...\n");
         $parseContext['currentFile']='';
         $parseContext['offset']=0;
         $parseContext['hash']='';
         $parseContext['height']=0;
-        // Oeps hoped this wouldn't occur; Start from scratch
     }
 }
 if (!$recovery){
@@ -268,7 +266,7 @@ foreach (extractBlocksFromStream() as $entry) {
     if ($raceStatus!=$raceToTheTop){
         L("Top reached at height ".($height-1)."\n");
         if (!$fullBackup) {
-            backup(true);
+            backup(true,$height-1,$lastBlockHash);
             $fullBackup=true;
         }
         $raceStatus=$raceToTheTop;
@@ -334,9 +332,7 @@ foreach (extractBlocksFromStream() as $entry) {
         
         $lastBlockHash=$entry['hash'];
         if (($height>=$BLOCKINDEX->backupHeight) && (($height%$BLOCKINDEX->maxReorgDepth)==0)) {
-            $parseContext['hash']=$entry['prevHash'];
-            $parseContext['height']=$height-1; // -1 because arriving entry isn't indexed yet
-            backup(); // No need to toutch backupHeight
+            backup(false,$height-1,$entry['prevHash']); // The arriving block is not indexed yet
         }
         $parsed = $parser->getBlock($entry['raw']);
 /// fresh parsed block        
@@ -348,7 +344,13 @@ foreach (extractBlocksFromStream() as $entry) {
             $BLKidx.=pack('vV',$entry['fileNumber'],$entry['offset']);  // pointer to block in blk*.dat (to avoid rpc getrawtransaction/txindex=1)
         }
         foreach ($parsed['transactions'] as $tx){
-            $txID=hashtable_add_TX($TX_table,[hex2bin($tx['txid']),$height,$TXO_table['bucket'][TOP]+1,0]);
+            $txHash=hex2bin($tx['txid']);
+            list($existingTxID,$existingTx)=find($TX_table,$txHash);
+            if ($existingTxID!==false && isset($existingTx[0]) && $existingTx[0]===$txHash) {
+                L("Duplicate transaction id {$tx['txid']} at height $height; index rebuild required\n");
+                die("Duplicate transaction index\n");
+            }
+            $txID=hashtable_add_TX($TX_table,[$txHash,$height,$TXO_table['bucket'][TOP]+1,0]);
             foreach ($tx['outputs'] as $output) {
                 // output(32): [0]n(4) [1]value/amount(8) [2]pubkeyhash(20)
                 // pub(36):    [0]scripthash(20) [1]blocknr/lastchange(4) [2]first-txo(4) [3]last-txo(4) [4]next hash%-collision(4)
@@ -583,152 +585,266 @@ function stripResources(array $table){ // to allow serialization
     }
     return $filtered;
 }
-function backup($full=false){
-    /* Backup occurs at $parseContext['height']. The block at that height was fully indexed
-       When you recover, start looking for the next height
+function readSerializedArray($path) {
+    if (!is_file($path)) {return false;}
+    $raw=@file_get_contents($path);
+    if ($raw===false) {return false;}
+    $value=@unserialize($raw,['allowed_classes'=>false]);
+    return is_array($value)?$value:false;
+}
+function writeSerializedArray($path,array $value) {
+    $serialized=serialize($value);
+    $written=@file_put_contents($path,$serialized,LOCK_EX);
+    return $written===strlen($serialized);
+}
+function backupTableTops() {
+    global $TX_table,$PUB_table,$TXO_table;
+    return [
+        'tx'=>(int)$TX_table['bucket'][TOP],
+        'pub'=>(int)$PUB_table['bucket'][TOP],
+        'txo'=>(int)$TXO_table['bucket'][TOP]
+    ];
+}
+function validBackupContext($context) {
+    if (!is_array($context) || !isset($context['height']) || !is_int($context['height']) || $context['height']<0) {return false;}
+    if (!isset($context['hash']) || !is_string($context['hash']) || !preg_match('/^[0-9a-f]{64}$/',$context['hash'])) {return false;}
+    if (!isset($context['currentFile']) || !is_string($context['currentFile']) || !isset($context['offset']) || !is_int($context['offset']) || $context['offset']<0) {return false;}
+    if (!isset($context['tableTops']) || !is_array($context['tableTops'])) {return false;}
+    foreach (['tx','pub','txo'] as $name) {
+        if (!isset($context['tableTops'][$name]) || !is_int($context['tableTops'][$name]) || $context['tableTops'][$name]<0) {return false;}
+    }
+    return true;
+}
+function backupPartValid($table,$part,$path) {
+    if (!is_array($table) || !isset($table[$part]) || !is_array($table[$part]) || !isset($table[$part][SIZE]) || !is_numeric($table[$part][SIZE])) {return false;}
+    $size=(int)$table[$part][SIZE];
+    if ($size<=0 || (float)$size!==(float)$table[$part][SIZE] || !is_file($path)) {return false;}
+    clearstatcache(true,$path);
+    return filesize($path)===$size;
+}
+function loadBackupCandidate($postfix,$full=false) {
+    $contextPath=$full?DATA."AUX":DATA.$postfix;
+    $context=readSerializedArray($contextPath);
+    $tx=readSerializedArray(DATA."TX_aux".($full?'':$postfix));
+    $pub=readSerializedArray(DATA."PUB_aux".($full?'':$postfix));
+    $txo=readSerializedArray(DATA."TXO_aux".($full?'':$postfix));
+    if (!validBackupContext($context) || $tx===false || $pub===false || $txo===false) {return false;}
+    if (!isset($tx['bucket'][TOP],$pub['bucket'][TOP],$txo['bucket'][TOP])) {return false;}
+    if ((int)$tx['bucket'][TOP]!==$context['tableTops']['tx'] || (int)$pub['bucket'][TOP]!==$context['tableTops']['pub'] || (int)$txo['bucket'][TOP]!==$context['tableTops']['txo']) {return false;}
+    $suffix=$full?'':$postfix;
+    if (!backupPartValid($tx,'hash',DATA."TX_hash$suffix") || !backupPartValid($pub,'hash',DATA."PUB_hash$suffix")) {return false;}
+    if ($full && (!backupPartValid($tx,'bucket',DATA."TX_bucket") || !backupPartValid($pub,'bucket',DATA."PUB_bucket") || !backupPartValid($txo,'bucket',DATA."TXO_bucket"))) {return false;}
+    return [
+        'postfix'=>$postfix,
+        'context'=>$context,
+        'tx'=>$tx,
+        'pub'=>$pub,
+        'txo'=>$txo,
+        'modified'=>(int)@filemtime($contextPath)
+    ];
+}
+function backupIsCanonical(array $candidate) {
+    global $RPC;
+    while (true) {
+        $hash=$RPC->call('getblockhash',[$candidate['context']['height']]);
+        if ($hash!==null) {break;}
+    }
+    return is_string($hash) && hash_equals($candidate['context']['hash'],$hash);
+}
+function backupPostfixForWrite() {
+    $first=loadBackupCandidate('_backup_1',false);
+    $second=loadBackupCandidate('_backup_2',false);
+    if ($first===false) {return '_backup_1';}
+    if ($second===false) {return '_backup_2';}
+    if ($first['context']['height']<$second['context']['height']) {return '_backup_1';}
+    if ($second['context']['height']<$first['context']['height']) {return '_backup_2';}
+    return @filemtime(DATA."_backup_1")<=@filemtime(DATA."_backup_2")?'_backup_1':'_backup_2';
+}
+function selectRewindBackup() {
+    $candidates=[];
+    foreach (['_backup_1','_backup_2'] as $postfix) {
+        $candidate=loadBackupCandidate($postfix,false);
+        if ($candidate===false) {
+            L("Reject incomplete rewind backup $postfix\n");
+        } elseif (backupIsCanonical($candidate)) {
+            $candidates[]=$candidate;
+        } else {
+            L("Reject non-canonical rewind backup $postfix at height {$candidate['context']['height']}\n");
+        }
+    }
+    usort($candidates,function($left,$right){
+        if ($left['context']['height']===$right['context']['height']) {return $right['modified']-$left['modified'];}
+        return $right['context']['height']-$left['context']['height'];
+    });
+    return count($candidates)>0?$candidates[0]:false;
+}
+function backup($full=false,$checkpointHeight=null,$checkpointHash=null){
+    /* The tables contain every indexed block through checkpointHeight.
+       Recovery resumes at checkpointHeight + 1.
     */
     global $TX_table,$PUB_table,$TXO_table,$parseContext;
 
+    if (!is_int($checkpointHeight) || $checkpointHeight<0 || !is_string($checkpointHash) || !preg_match('/^[0-9a-f]{64}$/',$checkpointHash)) {
+        die("Invalid backup checkpoint\n");
+    }
+    $parseContext['height']=$checkpointHeight;
+    $parseContext['hash']=$checkpointHash;
+    $parseContext['tableTops']=backupTableTops();
     $time=microtime(true);
     if (!$full) {
-        if (file_exists(DATA."_backup_1")) {$delta_1=time()-filemtime(DATA."_backup_1");} else {$delta_1=time();}
-        if (file_exists(DATA."_backup_2")) {$delta_2=time()-filemtime(DATA."_backup_2");} else {$delta_2=time();}
-        if ($delta_1>$delta_2) {$postfix="_backup_1";} else {$postfix="_backup_2";} // replace oldest
-        L("Backup $postfix at height {$parseContext['height']}: ");
-        
-        file_put_contents(DATA."TX_aux$postfix",serialize(stripResources($TX_table)));
-        file_put_contents(DATA."PUB_aux$postfix",serialize(stripResources($PUB_table)));
-        file_put_contents(DATA."TXO_aux$postfix",serialize(stripResources($TXO_table)));
-        file_put_contents(DATA."$postfix",serialize($parseContext));
-        
+        $postfix=backupPostfixForWrite();
+        L("Backup $postfix at height $checkpointHeight: ");
+        if (!writeSerializedArray(DATA."TX_aux$postfix",stripResources($TX_table)) || !writeSerializedArray(DATA."PUB_aux$postfix",stripResources($PUB_table)) || !writeSerializedArray(DATA."TXO_aux$postfix",stripResources($TXO_table))) {
+            die("Cannot write rewind backup metadata\n");
+        }
         dump_index($TX_table,"hash",DATA."TX_hash$postfix");
         dump_index($PUB_table,"hash",DATA."PUB_hash$postfix");
+        if (!backupPartValid(stripResources($TX_table),'hash',DATA."TX_hash$postfix") || !backupPartValid(stripResources($PUB_table),'hash',DATA."PUB_hash$postfix") || !writeSerializedArray(DATA.$postfix,$parseContext)) {
+            die("Incomplete rewind backup\n");
+        }
     } else {
-        L("Backup Full at height {$parseContext['height']}: ");
-        file_put_contents(DATA."AUX",serialize($parseContext));
-        file_put_contents(DATA."TX_aux",serialize(stripResources($TX_table)));
-        file_put_contents(DATA."PUB_aux",serialize(stripResources($PUB_table)));
-        file_put_contents(DATA."TXO_aux",serialize(stripResources($TXO_table)));
+        L("Backup Full at height $checkpointHeight: ");
+        if (!writeSerializedArray(DATA."TX_aux",stripResources($TX_table)) || !writeSerializedArray(DATA."PUB_aux",stripResources($PUB_table)) || !writeSerializedArray(DATA."TXO_aux",stripResources($TXO_table))) {
+            die("Cannot write full backup metadata\n");
+        }
         dump_index($TX_table,"hash",DATA."TX_hash");
         dump_index($PUB_table,"hash",DATA."PUB_hash");
         dump_index($TX_table,"bucket",DATA."TX_bucket");
         dump_index($PUB_table,"bucket",DATA."PUB_bucket");
         dump_index($TXO_table,"bucket",DATA."TXO_bucket");
+        $valid=backupPartValid(stripResources($TX_table),'hash',DATA."TX_hash") && backupPartValid(stripResources($PUB_table),'hash',DATA."PUB_hash") && backupPartValid(stripResources($TX_table),'bucket',DATA."TX_bucket") && backupPartValid(stripResources($PUB_table),'bucket',DATA."PUB_bucket") && backupPartValid(stripResources($TXO_table),'bucket',DATA."TXO_bucket");
+        if (!$valid || !writeSerializedArray(DATA."AUX",$parseContext)) {die("Incomplete full backup\n");}
     }
     L((microtime(true)-$time)."(s)\n");
 }
-function recover($full=false) { // Rewinds to a valid backup-tip
-    global $TX_table,$PUB_table,$TXO_table,$parseContext,$RPC;  
+function restoreAffectedPub($pubIndex,$backupTxTop,$backupPubTop,$backupTxoTop) {
+    global $TX_table,$PUB_table,$TXO_table;
+
+    if ($pubIndex<1 || $pubIndex>$backupPubTop) {die("Invalid affected PUB index\n");}
+    $pub=hashtable_read($PUB_table['bucket'],$pubIndex);
+    $txoIndex=$pub[2];
+    $visited=[];
+    $lastTxo=0;
+    $lastChangeHeight=0;
+    while (true) {
+        if ($txoIndex<1 || $txoIndex>$backupTxoTop || isset($visited[$txoIndex])) {die("Broken TXO linked list during rewind\n");}
+        $visited[$txoIndex]=true;
+        $txo=hashtable_read($TXO_table['bucket'],$txoIndex);
+        if ($txo[3]!==$pubIndex || $txo[0]<1 || $txo[0]>$backupTxTop) {die("Invalid TXO ownership during rewind\n");}
+        $tx=hashtable_read($TX_table['bucket'],$txo[0]);
+        $lastChangeHeight=max($lastChangeHeight,(int)$tx[1]);
+        if ($txo[4]!==0) {
+            if ($txo[4]<1 || $txo[4]>$backupTxTop) {die("Invalid spend pointer during rewind\n");}
+            $spend=hashtable_read($TX_table['bucket'],$txo[4]);
+            $lastChangeHeight=max($lastChangeHeight,(int)$spend[1]);
+        }
+        $lastTxo=$txoIndex;
+        $next=(int)$txo[5];
+        if ($next>$TXO_table['bucket'][TOP]) {die("TXO pointer beyond live index during rewind\n");}
+        if ($next===0 || $next>$backupTxoTop) {
+            if ($next>$backupTxoTop) {
+                $txo[5]=0;
+                hashtable_write($TXO_table['bucket'],$txoIndex,$txo);
+            }
+            break;
+        }
+        $txoIndex=$next;
+    }
+    $pub[1]=$lastChangeHeight;
+    $pub[3]=$lastTxo;
+    hashtable_write($PUB_table['bucket'],$pubIndex,$pub);
+}
+function repairCollisionPointers(&$table,$pointerIndex) {
+    $top=$table['bucket'][TOP];
+    for ($i=1;$i<=$top;$i++) {
+        $content=hashtable_read($table['bucket'],$i);
+        if ($content[$pointerIndex]>$top) {
+            $content[$pointerIndex]=0;
+            hashtable_write($table['bucket'],$i,$content);
+        }
+    }
+}
+function restoreTableKeys() {
+    global $TX_table,$PUB_table,$TXO_table;
+    $TX_table['hash'][KEY]=ftok(__FILE__,'A');
+    $TX_table['bucket'][KEY]=ftok(__FILE__,'B');
+    $PUB_table['hash'][KEY]=ftok(__FILE__,'C');
+    $PUB_table['bucket'][KEY]=ftok(__FILE__,'D');
+    $TXO_table['bucket'][KEY]=ftok(__FILE__,'E');
+}
+function recover($full=false) { // Rewinds to the highest complete canonical backup-tip
+    global $TX_table,$PUB_table,$TXO_table,$parseContext;
     $time=microtime(true);
 
     if ($full) {
-        $parseContext=unserialize(file_get_contents(DATA."AUX"));
-        L("Recover Full till height ".$parseContext['height']."\n");
-        $TX_table=unserialize(file_get_contents(DATA."TX_aux"));
-        $PUB_table=unserialize(file_get_contents(DATA."PUB_aux"));
-        $TXO_table=unserialize(file_get_contents(DATA."TXO_aux"));
+        $candidate=loadBackupCandidate('',true);
+        if ($candidate===false || !backupIsCanonical($candidate)) {return false;}
+        $parseContext=$candidate['context'];
+        $TX_table=$candidate['tx'];
+        $PUB_table=$candidate['pub'];
+        $TXO_table=$candidate['txo'];
+        restoreTableKeys();
+        L("Recover Full till height {$parseContext['height']}\n");
         hashtable_initialize($TX_table['hash']);
         hashtable_initialize($TX_table['bucket']);
         hashtable_initialize($PUB_table['hash']);
         hashtable_initialize($PUB_table['bucket']);
-        hashtable_initialize($TXO_table['bucket']);    
+        hashtable_initialize($TXO_table['bucket']);
         load_index($TX_table,'hash',DATA."TX_hash");
         load_index($PUB_table,'hash',DATA."PUB_hash");
         load_index($TX_table,'bucket',DATA."TX_bucket");
         load_index($PUB_table,'bucket',DATA."PUB_bucket");
         load_index($TXO_table,'bucket',DATA."TXO_bucket");
-    } else {
-        if (file_exists(DATA."_backup_1")) {$delta_1=time()-filemtime(DATA."_backup_1");} else {$delta_1=time();}
-        if (file_exists(DATA."_backup_2")) {$delta_2=time()-filemtime(DATA."_backup_2");} else {$delta_2=time();}
-        if ($delta_1>$delta_2) {$postfix="_backup_2";} else {$postfix="_backup_1";} // try youngest first
-        L("Recover $postfix at height {$parseContext['height']}\n");
-    
-        $parseContext=unserialize(file_get_contents(DATA.$postfix));
-        while (true) {
-            $hash = $RPC->call('getblockhash', [$parseContext['height']]);
-            if ($hash!==null) {break;}
-        }
-        if ($hash!=$parseContext['hash']) { // rewind deeper
-            if ($postfix=="_backup_1") {$postfix="_backup_2";} else {$postfix="_backup_1";}
-            $parseContext=json_decode(file_get_contents(DATA.$postfix),true);
-            while (true) {
-                $hash = $RPC->call('getblockhash', [$parseContext['height']]);
-                if ($hash!==null) {break;}
-            }
-            if ($hash!=$parseContext['hash']) { // Oeps hoped this wouldn't occur; Both backups dont conform. Try latest Full backup
-                $parseContext=unserialize(file_get_contents(DATA."AUX"));
-                if ($hash!=$parseContext['hash']) {                    
-                    die("Cannot recover from backup at height {$parseContext['height']}\n Try full recovery (remove contents of data-directory).");
-                } else {
-                    recover(true);
-                    return;
-                }
-            }
-        }
+        return true;
+    }
 
-        $TX_table_backup=unserialize(file_get_contents(DATA."TX_aux".$postfix));
-        $PUB_table_backup=unserialize(file_get_contents(DATA."PUB_aux".$postfix));
-        $TXO_table_backup=unserialize(file_get_contents(DATA."TXO_aux".$postfix));
+    $candidate=selectRewindBackup();
+    if ($candidate===false) {
+        L("No canonical rewind backup; trying full backup\n");
+        if (!recover(true)) {die("No complete canonical backup available; index rebuild required\n");}
+        return true;
+    }
+    $parseContext=$candidate['context'];
+    $postfix=$candidate['postfix'];
+    $backupTxTop=$candidate['tx']['bucket'][TOP];
+    $backupPubTop=$candidate['pub']['bucket'][TOP];
+    $backupTxoTop=$candidate['txo']['bucket'][TOP];
+    $currentTxTop=$TX_table['bucket'][TOP];
+    $currentPubTop=$PUB_table['bucket'][TOP];
+    $currentTxoTop=$TXO_table['bucket'][TOP];
+    if ($backupTxTop>$currentTxTop || $backupPubTop>$currentPubTop || $backupTxoTop>$currentTxoTop) {die("Rewind backup is ahead of live indexes\n");}
+    L("Recover $postfix till height {$parseContext['height']}\n");
 
-        hashtable_initialize($TX_table['hash']);
-        hashtable_initialize($PUB_table['hash']);
-        load_index($TX_table,'hash',DATA."TX_hash$postfix");
-        load_index($PUB_table,'hash',DATA."PUB_hash$postfix");
-        
-        $truncTXOEnd  =$TXO_table['bucket'][TOP];
-        $truncTXOStart=$TXO_table_backup['bucket'][TOP]+1;
-        $truncPUBstart=$PUB_table_backup['bucket'][TOP]+1;
-        if (DEBUG) {L("$truncTXOStart,$truncTXOEnd,$truncPUBstart\n");}
-        $affected=[];
-        for ($i=$truncTXOStart;$i<=$truncTXOEnd;$i++) {
-            $content=hashtable_read($TXO_table['bucket'],$i);
-            if ($content[3]<$truncPUBstart) {$affected[$content[3]]=true;}
-        }
-        L((1+$truncTXOEnd-$truncTXOStart)." txo's concerned; ".count($affected)." pubkeys affected.\n");
-        foreach ($affected as $PUB_index=>$dummy){
-            $PUB_content=hashtable_read($PUB_table['bucket'],$PUB_index);
-            $more=true;
-            $TXO_index=$PUB_content[2];  // first
-            while ($more) {
-                $TXO_content=hashtable_read($TXO_table['bucket'],$TXO_index);
-                if ($TXO_content[5]==0) {
-                    L('Broken TXO-linked list');
-                    die();
-                } elseif ($TXO_content[5]>=$truncTXOStart) {
-                    $more=false;
-                    $PUB_content[3]=$TXO_index;
-                    hashtable_write($PUB_table['bucket'],$PUB_index,$PUB_content);
-                    $TXO_content[5]=0;
-                    hashtable_write($TXO_table['bucket'],$TXO_index,$TXO_content);
-                } else {
-                    $TXO_index=$TXO_content[5];  // next
-                }
-            }            
-        }
-        $TX_table['bucket'][TOP]=$TX_table_backup['bucket'][TOP];
-        $PUB_table['bucket'][TOP]=$PUB_table_backup['bucket'][TOP];
-        $TXO_table['bucket'][TOP]=$TXO_table_backup['bucket'][TOP];
-        // trunc TX_table; ($i=1 Can be optimized by finding the first transaction at blockheight==backup[TOP])
-        $collisionPointer=3;
-        $top=$TX_table['bucket'][TOP];
-        for ($i=1;$i<=$top;$i++) {
-            $content=hashtable_read($TX_table['bucket'],$i);
-            if ($content[$collisionPointer]>$top) {
-               $content[$collisionPointer]=0;
-               hashtable_write($TX_table['bucket'],$i,$content);
-            } 
-        }
-        // trunc PUB_table
-        $collisionPointer=4;
-        $top=$PUB_table['bucket'][TOP];
-        for ($i=1;$i<=$top;$i++) {
-            $content=hashtable_read($PUB_table['bucket'],$i);
-            if ($content[$collisionPointer]>$top) {
-               $content[$collisionPointer]=0;
-               hashtable_write($PUB_table['bucket'],$i,$content);
-            } 
+    hashtable_initialize($TX_table['hash']);
+    hashtable_initialize($PUB_table['hash']);
+    load_index($TX_table,'hash',DATA."TX_hash$postfix");
+    load_index($PUB_table,'hash',DATA."PUB_hash$postfix");
+
+    $affected=[];
+    for ($i=$backupTxoTop+1;$i<=$currentTxoTop;$i++) {
+        $txo=hashtable_read($TXO_table['bucket'],$i);
+        if ($txo[3]<1 || $txo[3]>$currentPubTop) {die("Invalid PUB pointer in removed TXO\n");}
+        if ($txo[3]>=1 && $txo[3]<=$backupPubTop) {$affected[$txo[3]]=true;}
+    }
+    for ($i=1;$i<=$backupTxoTop;$i++) {
+        $txo=hashtable_read($TXO_table['bucket'],$i);
+        if ($txo[4]>$currentTxTop) {die("Spend pointer beyond live TX index\n");}
+        if ($txo[4]>$backupTxTop) {
+            $txo[4]=0;
+            hashtable_write($TXO_table['bucket'],$i,$txo);
+            if ($txo[3]>=1 && $txo[3]<=$backupPubTop) {$affected[$txo[3]]=true;}
         }
     }
+    foreach ($affected as $pubIndex=>$dummy) {restoreAffectedPub($pubIndex,$backupTxTop,$backupPubTop,$backupTxoTop);}
+
+    $TX_table['bucket'][TOP]=$backupTxTop;
+    $PUB_table['bucket'][TOP]=$backupPubTop;
+    $TXO_table['bucket'][TOP]=$backupTxoTop;
+    repairCollisionPointers($TX_table,3);
+    repairCollisionPointers($PUB_table,4);
+    L(($currentTxoTop-$backupTxoTop)." txo's removed; ".count($affected)." pubkeys restored; ".(microtime(true)-$time)."(s)\n");
+    backup(true,$parseContext['height'],$parseContext['hash']);
+    return true;
 }
 function handleSocketRequests(float $deadline){
     global $alphabet;
@@ -1108,7 +1224,7 @@ function parsePubsParameters($params,&$parts,&$knownHeight,&$knownChanges,&$erro
     }
     return true;
 }
-function readPubsAddressState($address,$pubkeyhash,$index,array $record) {
+function readPubsAddressState($address,$pubkeyhash,$index,array $record,&$outpoints,&$error) {
     global $height,$TX_table,$TXO_table;
 
     $addressBalance=0;
@@ -1116,10 +1232,27 @@ function readPubsAddressState($address,$pubkeyhash,$index,array $record) {
     $lastChangeHeight=null;
     if ($index!==false && isset($record[0]) && $record[0]===$pubkeyhash) {
         $lastChangeHeight=(int)$record[1];
-        $txo=hashtable_read($TXO_table['bucket'],$record[2]);
-        while (isset($txo[3]) && $txo[3]===$index) {
+        $txoIndex=(int)$record[2];
+        $visited=[];
+        while (true) {
+            if ($txoIndex<1 || $txoIndex>$TXO_table['bucket'][TOP] || isset($visited[$txoIndex])) {
+                $error='CORRUPT_TXO_INDEX';
+                return false;
+            }
+            $visited[$txoIndex]=true;
+            $txo=hashtable_read($TXO_table['bucket'],$txoIndex);
+            if (!isset($txo[3]) || $txo[3]!==$index || $txo[0]<1 || $txo[0]>$TX_table['bucket'][TOP]) {
+                $error='CORRUPT_TXO_INDEX';
+                return false;
+            }
+            $tx=hashtable_read($TX_table['bucket'],$txo[0]);
+            $outpoint=bin2hex($tx[0]).':'.(int)$txo[1];
+            if (isset($outpoints[$outpoint])) {
+                $error='DUPLICATE_OUTPOINT';
+                return false;
+            }
+            $outpoints[$outpoint]=true;
             if ($txo[4]===0) {
-                $tx=hashtable_read($TX_table['bucket'],$txo[0]);
                 $value=(int)$txo[2];
                 $blockHeight=(int)$tx[1];
                 $utxos[]=[
@@ -1133,7 +1266,7 @@ function readPubsAddressState($address,$pubkeyhash,$index,array $record) {
                 $addressBalance+=$value;
             }
             if ($txo[5]!==0) {
-                $txo=hashtable_read($TXO_table['bucket'],$txo[5]);
+                $txoIndex=(int)$txo[5];
             } else {
                 break;
             }
@@ -1190,6 +1323,7 @@ function handlePubsRequest($id,$params) {
 
     $totalBalance=0;
     $addressStates=[];
+    $outpoints=[];
     foreach ($addresses as $position=>$item) {
         $address=$item['address'];
         $pubkeyhash=$item['pubkeyhash'];
@@ -1198,7 +1332,9 @@ function handlePubsRequest($id,$params) {
         if ($delta && $knownChanges[$position]===$lastChangeHeight) {
             continue;
         }
-        $addressState=readPubsAddressState($address,$pubkeyhash,$index,$record);
+        $stateError='';
+        $addressState=readPubsAddressState($address,$pubkeyhash,$index,$record,$outpoints,$stateError);
+        if ($addressState===false) {return pubsError($id,$stateError);}
         $addressStates[]=$addressState;
         if (!$delta) {
             $totalBalance+=$addressState['balance'];
