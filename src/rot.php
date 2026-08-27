@@ -1,8 +1,11 @@
 <?php
-/* [EFL-SLICE-034]
-ROT restart and orphan-rewind integrity repair with duplicate financial-index guards.
-Base: - Derived from EFL-SLICE-033
+/* [EFL-SLICE-035]
+ROT storage-root separation for shared-script environment deployments.
+Base: - Derived from EFL-SLICE-034
 Changes:
+- [EFL-SLICE-035] Require ROT_DATA_DIR separately from CORE_DATA_DIR in environment mode
+- Use the configuration-file directory as ROT storage root in config-file mode
+- Stop creating ROT runtime directories inside the Core blockchain directory
 - [EFL-SLICE-034] Bind every full and rolling backup to the exact indexed height, hash and table tops
 - Select the highest canonical rewind checkpoint instead of trusting file modification order
 - Restore orphaned spend markers, PUB last-change heights and TXO list tails during rewind
@@ -61,36 +64,60 @@ Changes:
   +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 */   
 
-$environment_error='';
+$environmentError='';
 $options = getopt('c:h', ['config:', 'help']);
 if (isset($options['h']) || isset($options['help'])) {die("Usage: php rot.php --config=/path/to/rot.conf\n");}
 $configFile = $options['c'] ?? $options['config'] ?? getenv('ROT_CONFIG') ?? null;
-// $configPath = $options['c'] ?? $options['config'] ?? getenv('ROT_CONFIG') ?? null;
 if ($configFile) {
-    if (!is_file($configFile)) {die("Error: config not found: $configPath\n");}
-    $parts = explode('|', trim(file_get_contents($configFile)));
+    $resolvedConfigFile=realpath($configFile);
+    if ($resolvedConfigFile===false || !is_file($resolvedConfigFile)) {die("Error: config not found: $configFile\n");}
+    $parts = explode('|', trim(file_get_contents($resolvedConfigFile)));
     if (count($parts) !== 7) {die("Error: invalid config format (expected 7 fields)\n");}
     [$tikker,$rpchost,$user,$ww,$rpcport,$socket,$datadir] = $parts;
+    $rotDataDir=dirname($resolvedConfigFile);
     if ($datadir && !is_dir($datadir)) {die("$datadir does not exist;\n");}
 } else {
-    $environment_error='';
-    $rpchost = getenv('CORE_RPC_HOST') ?: $environment_error.="CORE_RPC_HOST required;\n"; 
-    $rpcport  = getenv('CORE_RPC_PORT') ?: $environment_error.="CORE_RPC_PORT required;\n"; 
-    $user  = getenv('CORE_RPC_USER') ?: $environment_error.="CORE_RPC_USER required;\n";
-    $ww  = getenv('CORE_RPC_PASSWORD') ?: $environment_error.="CORE_RPC_PASSWORD required;\n";
-    $datadir  = getenv('CORE_DATA_DIR') ?: $environment_error.="CORE_DATA_DIR required;\n";
-    $socket  = getenv('ROT_LISTEN_ADDR') ?: $environment_error.="ROT_LISTEN_ADDR required;\n"; 
-    $tikker = getenv('ROT_COIN_TIKKER') ?: $environment_error.="ROT_COIN_TIKKER required;\n"; 
-    if (!file_exists($datadir)) {$environment_error.="$datadir does not exist;\n";}
-    if ($environment_error!=''){die($environment_error);}
+    $environmentError='';
+    $rpchost=getenv('CORE_RPC_HOST');
+    $rpcport=getenv('CORE_RPC_PORT');
+    $user=getenv('CORE_RPC_USER');
+    $ww=getenv('CORE_RPC_PASSWORD');
+    $datadir=getenv('CORE_DATA_DIR');
+    $rotDataDir=getenv('ROT_DATA_DIR');
+    $socket=getenv('ROT_LISTEN_ADDR');
+    $tikker=getenv('ROT_COIN_TIKKER');
+    if (!$rpchost) {$environmentError.="CORE_RPC_HOST required;\n";}
+    if (!$rpcport) {$environmentError.="CORE_RPC_PORT required;\n";}
+    if (!$user) {$environmentError.="CORE_RPC_USER required;\n";}
+    if (!$ww) {$environmentError.="CORE_RPC_PASSWORD required;\n";}
+    if (!$datadir) {$environmentError.="CORE_DATA_DIR required;\n";}
+    if (!$rotDataDir) {$environmentError.="ROT_DATA_DIR required;\n";}
+    if (!$socket) {$environmentError.="ROT_LISTEN_ADDR required;\n";}
+    if (!$tikker) {$environmentError.="ROT_COIN_TIKKER required;\n";}
+    if ($datadir && !is_dir($datadir)) {$environmentError.="$datadir does not exist;\n";}
+    if ($rotDataDir && !is_dir($rotDataDir)) {$environmentError.="$rotDataDir does not exist;\n";}
+    if ($environmentError!=''){die($environmentError);}
 }
 
-$configPath = $datadir."/ROT";
-if (!file_exists($configPath)) {mkdir($configPath);}
-define ("VERSION","0.6");
+$resolvedCoreDataDir=realpath($datadir);
+$resolvedRotDataDir=realpath($rotDataDir);
+if ($resolvedCoreDataDir===false) {die("Invalid Core data directory\n");}
+if ($resolvedRotDataDir===false) {die("Invalid ROT data directory\n");}
+$corePath=rtrim($resolvedCoreDataDir,"/\\");
+$rotPath=rtrim($resolvedRotDataDir,"/\\");
+if ($corePath==='') {die("Core data directory cannot be the filesystem root\n");}
+if ($rotPath==='') {die("ROT data directory cannot be the filesystem root\n");}
+$corePrefix=$corePath.DIRECTORY_SEPARATOR;
+$rotPrefix=$rotPath.DIRECTORY_SEPARATOR;
+if ($corePath===$rotPath || strpos($rotPrefix,$corePrefix)===0 || strpos($corePrefix,$rotPrefix)===0) {
+    die("CORE_DATA_DIR and ROT_DATA_DIR must be separate directory trees\n");
+}
+$datadir=$corePath;
+$rotDataDir=$rotPath;
+define ("VERSION","0.7");
 define ("MAX_PUBS",51);
 define ("MAX_RAW_TRANSACTION_HEX",65000);
-define("ROOT",dirname($configPath)."/");
+define("ROOT",$rotDataDir."/");
 define("Q",ROOT."Q");
 define("A",ROOT."A");
 define("DATA",ROOT."data/");
