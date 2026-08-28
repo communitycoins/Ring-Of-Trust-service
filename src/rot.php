@@ -1,8 +1,10 @@
 <?php
-/* [EFL-SLICE-044]
-ROT wallet-history bootstrap over the existing legacy address indexes.
-Base: - Derived from EFL-SLICE-035
+/* [EFL-SLICE-046]
+ROT compatibility probe for verbose mempool transaction decoding.
+Base: - Derived from EFL-SLICE-044
 Changes:
+- [EFL-SLICE-046] Pass numeric verbose mode 1 to getrawtransaction for legacy Core compatibility
+- Preserve exact mempool txid, recipient address and satoshi-amount verification
 - [EFL-SLICE-044] Return confirmed IN and external OUT history for one atomic wallet address set
 - Exclude wallet change and attach canonical block height and timestamp to every history event
 - Bound and integrity-check address walks, spending transactions and history response size
@@ -117,7 +119,7 @@ if ($corePath===$rotPath || strpos($rotPrefix,$corePrefix)===0 || strpos($corePr
 }
 $datadir=$corePath;
 $rotDataDir=$rotPath;
-define ("VERSION","0.8");
+define ("VERSION","0.8.1");
 define ("MAX_PUBS",51);
 define ("MAX_HISTORY_EVENTS",2000);
 define ("MAX_HISTORY_WALLET_OUTPUTS",4000);
@@ -1197,7 +1199,7 @@ function handleZeroConfirmationRequest($id,$parameters) {
         return sendResponse($id,true,'NOT_SEEN',$txid,['address'=>$address,'amountSats'=>$amountSats,'confirmed'=>false,'coreMs'=>$mempool['durationMs'],'rotMs'=>(int)round((microtime(true)-$started)*1000)]);
     }
 
-    $decoded=$RPC->callResult('getrawtransaction',[$txid,true]);
+    $decoded=$RPC->callResult('getrawtransaction',[$txid,1]);
     $coreMs=$mempool['durationMs']+$decoded['durationMs'];
     if ($decoded['technical'] || !$decoded['ok'] || !is_array($decoded['result']) || !isset($decoded['result']['txid']) || strtolower((string)$decoded['result']['txid'])!==$txid || !isset($decoded['result']['vout']) || !is_array($decoded['result']['vout'])) {
         return sendResponse($id,false,'UNAVAILABLE',$txid,['technical'=>true,'address'=>$address,'amountSats'=>$amountSats,'error'=>'CORE_TRANSACTION_UNAVAILABLE','coreMs'=>$coreMs,'rotMs'=>(int)round((microtime(true)-$started)*1000)]);
