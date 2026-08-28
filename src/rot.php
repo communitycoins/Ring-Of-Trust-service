@@ -1,8 +1,11 @@
 <?php
-/* [EFL-SLICE-035]
-ROT storage-root separation for shared-script environment deployments.
-Base: - Derived from EFL-SLICE-034
+/* [EFL-SLICE-044]
+ROT wallet-history bootstrap over the existing legacy address indexes.
+Base: - Derived from EFL-SLICE-035
 Changes:
+- [EFL-SLICE-044] Return confirmed IN and external OUT history for one atomic wallet address set
+- Exclude wallet change and attach canonical block height and timestamp to every history event
+- Bound and integrity-check address walks, spending transactions and history response size
 - [EFL-SLICE-035] Require ROT_DATA_DIR separately from CORE_DATA_DIR in environment mode
 - Use the configuration-file directory as ROT storage root in config-file mode
 - Stop creating ROT runtime directories inside the Core blockchain directory
@@ -114,8 +117,10 @@ if ($corePath===$rotPath || strpos($rotPrefix,$corePrefix)===0 || strpos($corePr
 }
 $datadir=$corePath;
 $rotDataDir=$rotPath;
-define ("VERSION","0.7");
+define ("VERSION","0.8");
 define ("MAX_PUBS",51);
+define ("MAX_HISTORY_EVENTS",2000);
+define ("MAX_HISTORY_WALLET_OUTPUTS",4000);
 define ("MAX_RAW_TRANSACTION_HEX",65000);
 define("ROOT",$rotDataDir."/");
 define("Q",ROOT."Q");
@@ -1382,6 +1387,157 @@ function handlePubsRequest($id,$params) {
     }
     return encodePubsResponse($response);
 }
+function historyBlockTimestamps(array $heights,&$error) {
+    global $RPC;
+
+    $timestamps=[];
+    foreach (array_chunk($heights,500) as $heightChunk) {
+        $calls=[];
+        foreach ($heightChunk as $blockHeight) {$calls[]=['getblockhash',[$blockHeight]];}
+        $hashResults=$RPC->batch($calls);
+        ksort($hashResults,SORT_NUMERIC);
+        $hashResults=array_values($hashResults);
+        if (count($hashResults)!==count($heightChunk)) {$error='HISTORY_TIME_UNAVAILABLE';return false;}
+        $headerCalls=[];
+        foreach ($hashResults as $hash) {
+            if ($hash instanceof \Exception || !is_string($hash) || !preg_match('/^[0-9a-fA-F]{64}$/',$hash)) {$error='HISTORY_TIME_UNAVAILABLE';return false;}
+            $headerCalls[]=['getblockheader',[$hash,true]];
+        }
+        $headerResults=$RPC->batch($headerCalls);
+        ksort($headerResults,SORT_NUMERIC);
+        $headerResults=array_values($headerResults);
+        if (count($headerResults)!==count($heightChunk)) {$error='HISTORY_TIME_UNAVAILABLE';return false;}
+        foreach ($headerResults as $offset=>$header) {
+            if ($header instanceof \Exception || !is_array($header) || !isset($header['time']) || !is_int($header['time']) || $header['time']<1) {$error='HISTORY_TIME_UNAVAILABLE';return false;}
+            $timestamps[$heightChunk[$offset]]=$header['time'];
+        }
+    }
+    return $timestamps;
+}
+function addHistoryEvent(&$events,$direction,$txid,$vout,$value,$address,$blockHeight) {
+    if (count($events)>=MAX_HISTORY_EVENTS) {return false;}
+    $events[]=[
+        'direction'=>$direction,
+        'txid'=>$txid,
+        'vout'=>$vout,
+        'value'=>$value,
+        'address'=>$address,
+        'height'=>$blockHeight
+    ];
+    return true;
+}
+function handleHistoryRequest($id,$params) {
+    global $height,$lastBlockHash,$TX_table,$TXO_table,$PUB_table,$versionByte,$tikker;
+
+    if (!is_string($id) || $id==='' || strlen($id)>64) {return pubsError($id,'INVALID_ID');}
+    $parts=explode(',',$params);
+    if (count($parts)<1 || count($parts)>MAX_PUBS) {return pubsError($id,'INVALID_ADDRESS_COUNT');}
+
+    $addresses=[];
+    $seen=[];
+    $walletPubIds=[];
+    foreach ($parts as $part) {
+        $address=trim($part);
+        if ($address==='' || isset($seen[$address])) {return pubsError($id,'INVALID_ADDRESS_SET');}
+        $payload=base58check_decode($address);
+        if ($payload===false || strlen($payload)!==21 || ord($payload[0])!==$versionByte) {return pubsError($id,'INVALID_COIN_ADDRESS');}
+        $pubkeyhash=substr($payload,1,20);
+        list($pubId,$record)=find($PUB_table,$pubkeyhash);
+        if ($pubId!==false && isset($record[0]) && $record[0]===$pubkeyhash) {$walletPubIds[$pubId]=true;}
+        $addresses[]=['address'=>$address,'pubId'=>$pubId,'record'=>$record,'pubkeyhash'=>$pubkeyhash];
+        $seen[$address]=true;
+    }
+
+    $walletOutputs=[];
+    $outgoingTransactions=[];
+    $visitedOutputs=[];
+    foreach ($addresses as $item) {
+        if ($item['pubId']===false || !isset($item['record'][0]) || $item['record'][0]!==$item['pubkeyhash']) {continue;}
+        $txoIndex=(int)$item['record'][2];
+        $addressVisited=[];
+        while (true) {
+            if ($txoIndex<1 || $txoIndex>$TXO_table['bucket'][TOP] || isset($addressVisited[$txoIndex]) || isset($visitedOutputs[$txoIndex])) {return pubsError($id,'CORRUPT_TXO_INDEX');}
+            $addressVisited[$txoIndex]=true;
+            $visitedOutputs[$txoIndex]=true;
+            $txo=hashtable_read($TXO_table['bucket'],$txoIndex);
+            if (!isset($txo[3]) || $txo[3]!==$item['pubId'] || $txo[0]<1 || $txo[0]>$TX_table['bucket'][TOP]) {return pubsError($id,'CORRUPT_TXO_INDEX');}
+            $tx=hashtable_read($TX_table['bucket'],$txo[0]);
+            if (!isset($tx[0]) || strlen($tx[0])!==32 || $tx[1]<1 || $tx[1]>$height-1) {return pubsError($id,'CORRUPT_TX_INDEX');}
+            if (count($walletOutputs)>=MAX_HISTORY_WALLET_OUTPUTS) {return pubsError($id,'HISTORY_TOO_LARGE');}
+            $walletOutputs[]=[
+                'txIndex'=>(int)$txo[0],
+                'txid'=>bin2hex($tx[0]),
+                'vout'=>(int)$txo[1],
+                'value'=>(int)$txo[2],
+                'address'=>$item['address'],
+                'height'=>(int)$tx[1]
+            ];
+            if ($txo[4]!==0) {
+                if ($txo[4]<1 || $txo[4]>$TX_table['bucket'][TOP]) {return pubsError($id,'CORRUPT_TX_INDEX');}
+                $outgoingTransactions[(int)$txo[4]]=true;
+                if (count($outgoingTransactions)>MAX_HISTORY_EVENTS) {return pubsError($id,'HISTORY_TOO_LARGE');}
+            }
+            if ($txo[5]===0) {break;}
+            $txoIndex=(int)$txo[5];
+        }
+    }
+
+    $events=[];
+    foreach ($walletOutputs as $output) {
+        if (isset($outgoingTransactions[$output['txIndex']])) {continue;}
+        if (!addHistoryEvent($events,'IN',$output['txid'],$output['vout'],$output['value'],$output['address'],$output['height'])) {return pubsError($id,'HISTORY_TOO_LARGE');}
+    }
+    foreach ($outgoingTransactions as $txIndex=>$unused) {
+        $tx=hashtable_read($TX_table['bucket'],$txIndex);
+        if (!isset($tx[0]) || strlen($tx[0])!==32 || $tx[1]<1 || $tx[1]>$height-1 || $tx[2]<1 || $tx[2]>$TXO_table['bucket'][TOP]) {return pubsError($id,'CORRUPT_TX_INDEX');}
+        $txid=bin2hex($tx[0]);
+        $txoIndex=(int)$tx[2];
+        $transactionVisited=[];
+        $transactionOutputCount=0;
+        while ($txoIndex<=$TXO_table['bucket'][TOP]) {
+            if (isset($transactionVisited[$txoIndex])) {return pubsError($id,'CORRUPT_TXO_INDEX');}
+            $transactionVisited[$txoIndex]=true;
+            $transactionOutputCount++;
+            if ($transactionOutputCount>MAX_HISTORY_EVENTS) {return pubsError($id,'HISTORY_TOO_LARGE');}
+            $txo=hashtable_read($TXO_table['bucket'],$txoIndex);
+            if ($txo[0]!==$txIndex) {break;}
+            if ($txo[3]<1 || $txo[3]>$PUB_table['bucket'][TOP]) {return pubsError($id,'CORRUPT_TXO_INDEX');}
+            if (!isset($walletPubIds[$txo[3]])) {
+                $pub=hashtable_read($PUB_table['bucket'],$txo[3]);
+                if (!isset($pub[0]) || strlen($pub[0])!==20) {return pubsError($id,'CORRUPT_TXO_INDEX');}
+                $address=address_from_pubkeyhash($pub[0]);
+                if (!addHistoryEvent($events,'OUT',$txid,(int)$txo[1],(int)$txo[2],$address,(int)$tx[1])) {return pubsError($id,'HISTORY_TOO_LARGE');}
+            }
+            $txoIndex++;
+        }
+    }
+
+    usort($events,function($left,$right){
+        if ($left['height']!==$right['height']) {return $left['height']<$right['height']?-1:1;}
+        $txCompare=strcmp($left['txid'],$right['txid']);
+        if ($txCompare!==0) {return $txCompare;}
+        if ($left['vout']!==$right['vout']) {return $left['vout']<$right['vout']?-1:1;}
+        return strcmp($left['direction'],$right['direction']);
+    });
+    $eventHeights=[];
+    foreach ($events as $event) {$eventHeights[$event['height']]=true;}
+    $timeError='';
+    $timestamps=historyBlockTimestamps(array_keys($eventHeights),$timeError);
+    if ($timestamps===false) {return pubsError($id,$timeError);}
+    foreach ($events as &$event) {
+        $event['timestamp']=$timestamps[$event['height']];
+    }
+    unset($event);
+
+    return encodePubsResponse([
+        'ok'=>true,
+        'id'=>$id,
+        'coin'=>$tikker,
+        'height'=>max(0,$height-1),
+        'blockHash'=>$lastBlockHash,
+        'events'=>$events
+    ]);
+}
 function handleClientRequest($request) {
     global $height,$TX_table,$TXO_table,$PUB_table,$versionByte;
     
@@ -1529,6 +1685,8 @@ function handleClientRequest($request) {
         return handleTransactionStatusRequest($cmd[0],$b);
     } elseif ($a=="zeroconf"){
         return handleZeroConfirmationRequest($cmd[0],$b);
+    } elseif ($a=="history"){
+        return handleHistoryRequest($cmd[0],$b);
     } elseif ($a=="pubs"){
         return handlePubsRequest($cmd[0],$b);
     } elseif ($a=="pub"){
