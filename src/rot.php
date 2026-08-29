@@ -1,8 +1,12 @@
 <?php
-/* [MULTI-COIN-015]
-ROT 0.8.2 compatibility fallback for historical block timestamps.
-Base: - Derived from EFL-SLICE-046 / ROT 0.8.1
+/* [MULTI-COIN-016]
+ROT 0.8.3 coin-aware mempool payment verification.
+Base: - Derived from MULTI-COIN-015 / ROT 0.8.2
 Changes:
+- [MULTI-COIN-016] Move atomic units into the ROT coin specification
+- Convert verbose Core output values with the active coin's decimal precision
+- Verify DEM mempool payments in 1,000,000 units without changing confirmed index values
+- Preserve the existing eight-decimal behavior for EFL and the other configured coins
 - [MULTI-COIN-015] Preserve getblockheader as the primary history timestamp RPC
 - Fall back only unavailable or invalid timestamp reads to coin-neutral getblock
 - Retain strict atomic history failure when neither RPC returns a valid block time
@@ -122,7 +126,7 @@ if ($corePath===$rotPath || strpos($rotPrefix,$corePrefix)===0 || strpos($corePr
 }
 $datadir=$corePath;
 $rotDataDir=$rotPath;
-define ("VERSION","0.8.2");
+define ("VERSION","0.8.3");
 define ("MAX_PUBS",51);
 define ("MAX_HISTORY_EVENTS",2000);
 define ("MAX_HISTORY_WALLET_OUTPUTS",4000);
@@ -139,6 +143,8 @@ if (file_exists(ROOT."DEBUG")) {define("DEBUG",true);echo "debug mode\n";} else 
 $alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 $versionsBytes = ["LTC" => 48,"BTC" => 0x00,"CDN" => 28,"DEM" => 53,"EFL" => 48,"AUR" => 23,"PAK" => 0x00,"SLG" => 0x00,"RUBTC" => 0x00,
                   "FJC" => 0x00,"BOLI" => 0x00,"CESC" => 0x00];
+$coinUnits = ["LTC" => 100000000,"BTC" => 100000000,"CDN" => 100000000,"DEM" => 1000000,"EFL" => 100000000,"AUR" => 100000000,
+              "PAK" => 100000000,"SLG" => 100000000,"RUBTC" => 100000000,"FJC" => 100000000,"BOLI" => 100000000,"CESC" => 100000000];
 function now(){return date('d-m-Y H:i');}
 function L($what){$extra="";if (($what!=".")&&(substr($what,-1)!="\n")){$extra="\n";}file_put_contents(ROOT."rot.log",$what.$extra,FILE_APPEND);echo $what.$extra;}
 if (!function_exists('array_key_last')) {function array_key_last(array $array) {if (empty($array)) {return null;}return key(array_slice($array, -1, 1, true));}}
@@ -152,7 +158,10 @@ register_shutdown_function(function(){@unlink(ROOT."pid");});
 $rpchost='127.0.0.1';
 if (strpos($rpcport,":")>0) {list($rpchost,$rpcport)=explode(":",$rpcport);}
 $tikker=strtoupper($tikker);
+if (!isset($versionsBytes[$tikker]) || !isset($coinUnits[$tikker]) || !preg_match('/^10*$/',(string)$coinUnits[$tikker])) {die("Unsupported coin specification\n");}
 $versionByte=$versionsBytes[$tikker];
+$unitsPerCoin=$coinUnits[$tikker];
+$coinDecimals=strlen((string)$unitsPerCoin)-1;
 define ("SOCKET",$socket);
 
 L("==== Start ".now()." Version ".VERSION."  $tikker ====\n\n");
@@ -1120,22 +1129,25 @@ function handleTransactionStatusRequest($id,$txid) {
     }
     return sendResponse($id,true,'UNKNOWN',$txid,array_merge($timing,['confirmed'=>false]));
 }
-function coinValueToSats($value) {
+function coinValueToAtomicUnits($value) {
+    global $unitsPerCoin,$coinDecimals;
+
     if (!is_int($value) && !is_float($value) && !is_string($value)) {
         return false;
     }
-    if (is_string($value) && !preg_match('/^(0|[1-9][0-9]*)(\.[0-9]{1,8})?$/',$value)) {
+    $pattern='/^(0|[1-9][0-9]*)(\.[0-9]{1,'.$coinDecimals.'})?$/';
+    if (is_string($value) && !preg_match($pattern,$value)) {
         return false;
     }
-    $decimal=is_string($value)?$value:number_format($value,8,'.','');
+    $decimal=is_string($value)?$value:number_format($value,$coinDecimals,'.','');
     $parts=explode('.',$decimal,2);
     $whole=$parts[0];
-    $fraction=isset($parts[1])?str_pad($parts[1],8,'0'):str_repeat('0',8);
-    if (strlen($fraction)>8 || strlen($whole)>10) {
+    $fraction=isset($parts[1])?str_pad($parts[1],$coinDecimals,'0'):str_repeat('0',$coinDecimals);
+    if (strlen($fraction)>$coinDecimals || strlen($whole)>10) {
         return false;
     }
-    $sats=((int)$whole)*100000000+(int)$fraction;
-    return $sats>=0?$sats:false;
+    $units=((int)$whole)*$unitsPerCoin+(int)$fraction;
+    return $units>=0?$units:false;
 }
 function handleZeroConfirmationRequest($id,$parameters) {
     global $RPC,$height,$lastBlockHash,$TX_table,$TXO_table,$PUB_table,$versionByte;
@@ -1213,7 +1225,7 @@ function handleZeroConfirmationRequest($id,$parameters) {
         $scriptHex=strtolower((string)$output['scriptPubKey']['hex']);
         if (!preg_match('/^76a914([0-9a-f]{40})88ac$/',$scriptHex,$matches)) {continue;}
         $outputAddress=address_from_pubkeyhash(hex2bin($matches[1]));
-        $outputSats=coinValueToSats($output['value']);
+        $outputSats=coinValueToAtomicUnits($output['value']);
         if ($outputAddress===$address && $outputSats===$amountSats) {$matched=true;break;}
     }
     if (!$matched) {
