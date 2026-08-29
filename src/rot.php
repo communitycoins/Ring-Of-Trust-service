@@ -1,8 +1,11 @@
 <?php
-/* [EFL-SLICE-046]
-ROT compatibility probe for verbose mempool transaction decoding.
-Base: - Derived from EFL-SLICE-044
+/* [MULTI-COIN-015]
+ROT 0.8.2 compatibility fallback for historical block timestamps.
+Base: - Derived from EFL-SLICE-046 / ROT 0.8.1
 Changes:
+- [MULTI-COIN-015] Preserve getblockheader as the primary history timestamp RPC
+- Fall back only unavailable or invalid timestamp reads to coin-neutral getblock
+- Retain strict atomic history failure when neither RPC returns a valid block time
 - [EFL-SLICE-046] Pass numeric verbose mode 1 to getrawtransaction for legacy Core compatibility
 - Preserve exact mempool txid, recipient address and satoshi-amount verification
 - [EFL-SLICE-044] Return confirmed IN and external OUT history for one atomic wallet address set
@@ -119,7 +122,7 @@ if ($corePath===$rotPath || strpos($rotPrefix,$corePrefix)===0 || strpos($corePr
 }
 $datadir=$corePath;
 $rotDataDir=$rotPath;
-define ("VERSION","0.8.1");
+define ("VERSION","0.8.2");
 define ("MAX_PUBS",51);
 define ("MAX_HISTORY_EVENTS",2000);
 define ("MAX_HISTORY_WALLET_OUTPUTS",4000);
@@ -1389,6 +1392,12 @@ function handlePubsRequest($id,$params) {
     }
     return encodePubsResponse($response);
 }
+function historyTimestampFromResult($result) {
+    if (!is_array($result) || !isset($result['time']) || !is_int($result['time']) || $result['time']<1) {
+        return false;
+    }
+    return $result['time'];
+}
 function historyBlockTimestamps(array $heights,&$error) {
     global $RPC;
 
@@ -1408,10 +1417,36 @@ function historyBlockTimestamps(array $heights,&$error) {
         $headerResults=$RPC->batch($headerCalls);
         ksort($headerResults,SORT_NUMERIC);
         $headerResults=array_values($headerResults);
-        if (count($headerResults)!==count($heightChunk)) {$error='HISTORY_TIME_UNAVAILABLE';return false;}
-        foreach ($headerResults as $offset=>$header) {
-            if ($header instanceof \Exception || !is_array($header) || !isset($header['time']) || !is_int($header['time']) || $header['time']<1) {$error='HISTORY_TIME_UNAVAILABLE';return false;}
-            $timestamps[$heightChunk[$offset]]=$header['time'];
+        $chunkTimestamps=[];
+        $fallbackOffsets=[];
+        if (count($headerResults)!==count($heightChunk)) {
+            foreach ($heightChunk as $offset=>$blockHeight) {$fallbackOffsets[]=$offset;}
+        } else {
+            foreach ($headerResults as $offset=>$header) {
+                $timestamp=historyTimestampFromResult($header);
+                if ($timestamp===false) {
+                    $fallbackOffsets[]=$offset;
+                } else {
+                    $chunkTimestamps[$offset]=$timestamp;
+                }
+            }
+        }
+        if (count($fallbackOffsets)>0) {
+            $blockCalls=[];
+            foreach ($fallbackOffsets as $offset) {$blockCalls[]=['getblock',[$hashResults[$offset]]];}
+            $blockResults=$RPC->batch($blockCalls);
+            ksort($blockResults,SORT_NUMERIC);
+            $blockResults=array_values($blockResults);
+            if (count($blockResults)!==count($fallbackOffsets)) {$error='HISTORY_TIME_UNAVAILABLE';return false;}
+            foreach ($blockResults as $position=>$block) {
+                $timestamp=historyTimestampFromResult($block);
+                if ($timestamp===false) {$error='HISTORY_TIME_UNAVAILABLE';return false;}
+                $chunkTimestamps[$fallbackOffsets[$position]]=$timestamp;
+            }
+        }
+        foreach ($heightChunk as $offset=>$blockHeight) {
+            if (!isset($chunkTimestamps[$offset])) {$error='HISTORY_TIME_UNAVAILABLE';return false;}
+            $timestamps[$blockHeight]=$chunkTimestamps[$offset];
         }
     }
     return $timestamps;
