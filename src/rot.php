@@ -1,8 +1,11 @@
 <?php
-/* [MULTI-COIN-016]
-ROT 0.8.3 coin-aware mempool payment verification.
-Base: - Derived from MULTI-COIN-015 / ROT 0.8.2
+/* [MULTI-COIN-017]
+ROT 0.8.4 legacy Core mempool-output compatibility.
+Base: - Derived from MULTI-COIN-016 / ROT 0.8.3
 Changes:
+- [MULTI-COIN-017] Accept validated single-address P2PKH output metadata when legacy Core omits scriptPubKey.hex
+- Preserve script-hex derivation as the preferred exact-output path
+- Reject missing, multi-address, wrong-network and non-pubkeyhash address fallbacks
 - [MULTI-COIN-016] Move atomic units into the ROT coin specification
 - Convert verbose Core output values with the active coin's decimal precision
 - Verify DEM mempool payments in 1,000,000 units without changing confirmed index values
@@ -126,7 +129,7 @@ if ($corePath===$rotPath || strpos($rotPrefix,$corePrefix)===0 || strpos($corePr
 }
 $datadir=$corePath;
 $rotDataDir=$rotPath;
-define ("VERSION","0.8.3");
+define ("VERSION","0.8.4");
 define ("MAX_PUBS",51);
 define ("MAX_HISTORY_EVENTS",2000);
 define ("MAX_HISTORY_WALLET_OUTPUTS",4000);
@@ -1149,6 +1152,29 @@ function coinValueToAtomicUnits($value) {
     $units=((int)$whole)*$unitsPerCoin+(int)$fraction;
     return $units>=0?$units:false;
 }
+function coreP2pkhOutputAddress(array $output) {
+    global $versionByte;
+
+    if (!isset($output['scriptPubKey']) || !is_array($output['scriptPubKey'])) {
+        return false;
+    }
+    $script=$output['scriptPubKey'];
+    if (array_key_exists('hex',$script)) {
+        if (!is_string($script['hex']) || !preg_match('/^76a914([0-9a-fA-F]{40})88ac$/',$script['hex'],$matches)) {
+            return false;
+        }
+        return address_from_pubkeyhash(hex2bin($matches[1]));
+    }
+    if (!isset($script['type']) || $script['type']!=='pubkeyhash' || !isset($script['addresses']) || !is_array($script['addresses']) || count($script['addresses'])!==1 || !is_string($script['addresses'][0])) {
+        return false;
+    }
+    $address=$script['addresses'][0];
+    $payload=base58check_decode($address);
+    if ($payload===false || strlen($payload)!==21 || ord($payload[0])!==$versionByte) {
+        return false;
+    }
+    return $address;
+}
 function handleZeroConfirmationRequest($id,$parameters) {
     global $RPC,$height,$lastBlockHash,$TX_table,$TXO_table,$PUB_table,$versionByte;
 
@@ -1221,10 +1247,9 @@ function handleZeroConfirmationRequest($id,$parameters) {
     }
     $matched=false;
     foreach ($decoded['result']['vout'] as $output) {
-        if (!is_array($output) || !array_key_exists('value',$output) || !isset($output['scriptPubKey']['hex'])) {continue;}
-        $scriptHex=strtolower((string)$output['scriptPubKey']['hex']);
-        if (!preg_match('/^76a914([0-9a-f]{40})88ac$/',$scriptHex,$matches)) {continue;}
-        $outputAddress=address_from_pubkeyhash(hex2bin($matches[1]));
+        if (!is_array($output) || !array_key_exists('value',$output)) {continue;}
+        $outputAddress=coreP2pkhOutputAddress($output);
+        if ($outputAddress===false) {continue;}
         $outputSats=coinValueToAtomicUnits($output['value']);
         if ($outputAddress===$address && $outputSats===$amountSats) {$matched=true;break;}
     }
