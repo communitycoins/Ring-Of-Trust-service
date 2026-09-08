@@ -1,8 +1,13 @@
 <?php
-/* [MULTI-COIN-017]
-ROT 0.8.4 legacy Core mempool-output compatibility.
-Base: - Derived from MULTI-COIN-016 / ROT 0.8.3
+/* [CC-WALLET-006]
+ROT 0.8.5 bounded non-blocking socket transport and public-command hardening.
+Base: - Derived from MULTI-COIN-017 / ROT 0.8.4
 Changes:
+- [CC-WALLET-006] Buffer partial requests and responses without blocking the single ROT loop
+- Bound client count, per-client lifetime, request/response size and total socket memory
+- Recalculate stream_select deadlines on every pass and enlarge the listen backlog
+- Restrict the public legacy socket to wallet operations and disable remote diagnostics/stop
+- Add connect and total timeouts to batched Core RPC calls
 - [MULTI-COIN-017] Accept validated single-address P2PKH output metadata when legacy Core omits scriptPubKey.hex
 - Preserve script-hex derivation as the preferred exact-output path
 - Reject missing, multi-address, wrong-network and non-pubkeyhash address fallbacks
@@ -129,11 +134,19 @@ if ($corePath===$rotPath || strpos($rotPrefix,$corePrefix)===0 || strpos($corePr
 }
 $datadir=$corePath;
 $rotDataDir=$rotPath;
-define ("VERSION","0.8.4");
+define ("VERSION","0.8.5");
 define ("MAX_PUBS",51);
 define ("MAX_HISTORY_EVENTS",2000);
 define ("MAX_HISTORY_WALLET_OUTPUTS",4000);
 define ("MAX_RAW_TRANSACTION_HEX",65000);
+define ("MAX_SOCKET_CLIENTS",128);
+define ("MAX_SOCKET_ACCEPTS_PER_PASS",32);
+define ("MAX_SOCKET_REQUEST_BYTES",65536);
+define ("MAX_SOCKET_RESPONSE_BYTES",2097152);
+define ("MAX_SOCKET_BUFFER_BYTES",33554432);
+define ("SOCKET_READ_TIMEOUT",5.0);
+define ("SOCKET_WRITE_TIMEOUT",10.0);
+define ("SOCKET_BACKLOG",256);
 define("ROOT",$rotDataDir."/");
 define("Q",ROOT."Q");
 define("A",ROOT."A");
@@ -229,8 +242,8 @@ if (file_exists(DATA."AUX")){ // Recover...
 if (!$recovery){
     $parseContext['currentFile']='';
     $parseContext['offset']=0;
-    $TX_table['name']			="TX";
-    $TX_table['N']			=10000000;   // hash-positions (4-bytes a piece) -> 40Mb
+    $TX_table['name']           ="TX";
+    $TX_table['N']          =10000000;   // hash-positions (4-bytes a piece) -> 40Mb
     $TX_table['increment']              =100000000;  // increment empty space to prevent frequent reallocations (100 Mb)                                        
     if (($tikker=='LTC')||($tikker=='BTC')||($tikker=='DOGE')) {$multiplier=10;} else {$multiplier=1;}   // hash-positions -> 400Mb
     $bucketPercentage=1; // reduce memory based on history
@@ -895,74 +908,147 @@ function recover($full=false) { // Rewinds to the highest complete canonical bac
     backup(true,$parseContext['height'],$parseContext['hash']);
     return true;
 }
+function closeSocketClient(array &$clients,$id,&$bufferedBytes) {
+    if (!isset($clients[$id])) {return;}
+    $client=$clients[$id];
+    $remainingOutput=max(0,strlen($client['output'])-$client['outputOffset']);
+    $bufferedBytes=max(0,$bufferedBytes-strlen($client['input'])-$remainingOutput);
+    if (is_resource($client['socket'])) {fclose($client['socket']);}
+    unset($clients[$id]);
+}
+
 function handleSocketRequests(float $deadline){
-    global $alphabet;
-    static $clients = [];
+    static $clients=[];
     static $server;
-    static $rot=[];
-    static $network=[];
-    
-    if ($network === null) {
-    }
-    
-    if ($server === null) {
-        if (!file_exists(DATA.'rot')) {
-            //$rot['auth']="";
-            //for ($i=0;$i<32;$i++) {$rot['auth'].=$alphabet[mt_rand(0,57)];}
-            ////$rot['candidates']=parse_peers_dat();
-            ////$rot['candidateBatch']=time();
-        }
-        $server = stream_socket_server("tcp://0.0.0.0:".SOCKET, $errno, $errstr);
+    static $bufferedBytes=0;
+
+    if ($server===null) {
+        $context=stream_context_create(['socket'=>['backlog'=>SOCKET_BACKLOG]]);
+        $server=stream_socket_server(
+            "tcp://0.0.0.0:".SOCKET,
+            $errno,
+            $errstr,
+            STREAM_SERVER_BIND|STREAM_SERVER_LISTEN,
+            $context
+        );
         if (!$server) {die("Socket error: $errstr ($errno)");}
-        stream_set_blocking($server, false);
+        stream_set_blocking($server,false);
     }
-    $write  = null;
-    $except = null;
-    $timeout_sec=0;
-    while (microtime(true) < $deadline) {
-        $read = $clients;
-        $read[] = $server;
 
-        $remainingTime = $deadline - microtime(true);
-        if ($remainingTime <= 0) break;
-
-        $timeout_usec = (int) floor(($remainingTime - $timeout_sec) * 1000000);
-        if ($timeout_usec > 999999) { $timeout_sec += 1; $timeout_usec = 0; } // guard
-        
-        $ready = @stream_select($read, $write, $except, $timeout_sec, $timeout_usec); 
-        if ($ready === false) {
-            $err = error_get_last();
-            if (strpos($err['message'] ?? '', 'Interrupted system call') !== false) {
-                continue; // harmless
+    while (microtime(true)<$deadline) {
+        $now=microtime(true);
+        $read=[$server];
+        $write=[];
+        $except=null;
+        $waitUntil=$deadline;
+        foreach ($clients as $id=>$client) {
+            if ($client['output']==='') {
+                $read[$id]=$client['socket'];
+                $waitUntil=min($waitUntil,$client['readDeadline']);
+            } else {
+                $write[$id]=$client['socket'];
+                $waitUntil=min($waitUntil,$client['writeDeadline']);
             }
-            L("stream_select failed: " . $err['message']);
+        }
+        $remaining=max(0.0,$waitUntil-$now);
+        $timeoutSec=(int)floor($remaining);
+        $timeoutUsec=(int)floor(($remaining-$timeoutSec)*1000000);
+        $ready=@stream_select($read,$write,$except,$timeoutSec,$timeoutUsec);
+        if ($ready===false) {
+            $err=error_get_last();
+            $message=is_array($err) && isset($err['message'])?$err['message']:'unknown stream_select error';
+            if (strpos($message,'Interrupted system call')!==false) {continue;}
+            L("stream_select failed: ".$message);
             break;
         }
 
         foreach ($read as $sock) {
-            if ($sock === $server) {
-                $client = stream_socket_accept($server, 0);
-                if ($client) {
-                    stream_set_blocking($client, false);
-                    $clients[] = $client;
+            if ($sock===$server) {
+                $acceptedThisPass=0;
+                while ($acceptedThisPass<MAX_SOCKET_ACCEPTS_PER_PASS && ($client=@stream_socket_accept($server,0))!==false) {
+                    $acceptedThisPass++;
+                    if (count($clients)>=MAX_SOCKET_CLIENTS || $bufferedBytes>=MAX_SOCKET_BUFFER_BYTES) {
+                        fclose($client);
+                        continue;
+                    }
+                    stream_set_blocking($client,false);
+                    $id=(int)$client;
+                    $accepted=microtime(true);
+                    $clients[$id]=[
+                        'socket'=>$client,
+                        'input'=>'',
+                        'output'=>'',
+                        'outputOffset'=>0,
+                        'readDeadline'=>$accepted+SOCKET_READ_TIMEOUT,
+                        'writeDeadline'=>0.0
+                    ];
                 }
-            } else {
-                $line = stream_get_line($sock, 65536, "\n");
-                $meta = stream_get_meta_data($sock);
-                if ($meta['timed_out'] || $line === false || feof($sock)) {
-                    fclose($sock);
-                    if (DEBUG) {echo "socket issue...\n";}
-                    $clients = array_filter($clients, function($clientSocket) use ($sock) {return $clientSocket !== $sock;});
-                } else {
-                    if (DEBUG) {echo "$line\n";}
-                    $response = handleClientRequest($line);
-                    fwrite($sock, $response . "\n");
-                    fflush($sock);
-                    fclose($sock);
-                    if (DEBUG) {echo "$response\n";}
-                    $clients = array_filter($clients, function($clientSocket) use ($sock) {return $clientSocket !== $sock;});
-                }
+                continue;
             }
+            $id=(int)$sock;
+            if (!isset($clients[$id]) || $clients[$id]['output']!=='') {continue;}
+            $chunk=@fread($sock,8192);
+            if ($chunk===false || ($chunk==='' && feof($sock))) {
+                closeSocketClient($clients,$id,$bufferedBytes);
+                continue;
+            }
+            if ($chunk==='') {continue;}
+            $clients[$id]['input'].=$chunk;
+            $bufferedBytes+=strlen($chunk);
+            if (strlen($clients[$id]['input'])>MAX_SOCKET_REQUEST_BYTES || $bufferedBytes>MAX_SOCKET_BUFFER_BYTES) {
+                closeSocketClient($clients,$id,$bufferedBytes);
+                continue;
+            }
+            $newline=strpos($clients[$id]['input'],"\n");
+            if ($newline===false) {continue;}
+            $line=substr($clients[$id]['input'],0,$newline);
+            $trailing=substr($clients[$id]['input'],$newline+1);
+            if (trim($trailing)!=='') {
+                closeSocketClient($clients,$id,$bufferedBytes);
+                continue;
+            }
+            if (DEBUG) {echo $line."\n";}
+            $response=handleClientRequest($line)."\n";
+            $bufferedBytes-=strlen($clients[$id]['input']);
+            $clients[$id]['input']='';
+            if (strlen($response)>MAX_SOCKET_RESPONSE_BYTES || $bufferedBytes+strlen($response)>MAX_SOCKET_BUFFER_BYTES) {
+                closeSocketClient($clients,$id,$bufferedBytes);
+                continue;
+            }
+            $clients[$id]['output']=$response;
+            $clients[$id]['outputOffset']=0;
+            $clients[$id]['writeDeadline']=microtime(true)+SOCKET_WRITE_TIMEOUT;
+            $bufferedBytes+=strlen($response);
+            $write[$id]=$sock;
+            if (DEBUG) {echo $response;}
+        }
+
+        foreach ($write as $sock) {
+            $id=(int)$sock;
+            if (!isset($clients[$id]) || $clients[$id]['output']==='') {continue;}
+            $remainingOutput=strlen($clients[$id]['output'])-$clients[$id]['outputOffset'];
+            $chunk=substr($clients[$id]['output'],$clients[$id]['outputOffset'],min(65536,$remainingOutput));
+            $written=@fwrite($sock,$chunk);
+            if ($written===false) {
+                closeSocketClient($clients,$id,$bufferedBytes);
+                continue;
+            }
+            if ($written>0) {
+                $clients[$id]['outputOffset']+=$written;
+                $bufferedBytes=max(0,$bufferedBytes-$written);
+            }
+            if ($clients[$id]['outputOffset']>=strlen($clients[$id]['output'])) {
+                closeSocketClient($clients,$id,$bufferedBytes);
+            }
+        }
+
+        $now=microtime(true);
+        foreach (array_keys($clients) as $id) {
+            if (!isset($clients[$id])) {continue;}
+            $expired=$clients[$id]['output']===''
+                ?$now>=$clients[$id]['readDeadline']
+                :$now>=$clients[$id]['writeDeadline'];
+            if ($expired) {closeSocketClient($clients,$id,$bufferedBytes);}
         }
     }
 }
@@ -1621,6 +1707,8 @@ function handleClientRequest($request) {
         return "3!\n";
     }
     $a=$cmd[1];$b=$cmd[2];
+    $publicCommands=['stat','send','txstatus','zeroconf','history','pubs','pub','puball'];
+    if (!in_array($a,$publicCommands,true)) {return "?\n";}
     $output="";
     if ($a=="stat") {
         $txSpace=number_format(100-100*$TX_table['bucket'][TOP]*$TX_table['bucket'][RECORDSIZE]/$TX_table['bucket'][SIZE],1,".","");
@@ -2619,7 +2707,13 @@ class JsonRpcClient {
             $batch[] = $payload;
             $ids[$payload['id']] = $method;
         }
-        $responses = $this->sendRequest($batch);
+        try {
+            $responses=$this->sendRequest($batch);
+        } catch (\Exception $exception) {
+            $results=[];
+            foreach ($ids as $id=>$method) {$results[$id]=$exception;}
+            return $results;
+        }
         // Match responses by ID
         $results = [];
         foreach ($responses as $res) {
@@ -2648,11 +2742,15 @@ class JsonRpcClient {
             CURLOPT_POST => true,
             CURLOPT_POSTFIELDS => json_encode($payload),
             CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+            CURLOPT_CONNECTTIMEOUT => 2,
+            CURLOPT_TIMEOUT => 6,
         ]);
         $raw = curl_exec($ch);
         if ($raw === false) {
             $payloadTxt=print_r($payload,true);
-            throw new \Exception("CURL error \non {$this->url}\non $payloadTxt: " . curl_error($ch));
+            $curlError=curl_error($ch);
+            curl_close($ch);
+            throw new \Exception("CURL error \non {$this->url}\non $payloadTxt: ".$curlError);
         }
         curl_close($ch);
         $decoded = json_decode($raw, true);
@@ -2780,8 +2878,8 @@ function hashtable_add_TX(&$table,$record){
     The last link-pointer == 0 so apply (value-1) to obtain the index of the next record
       
     The (hash)index is accompanied by a $table structure to maintain the data:
-    $table['hash']   		// The (hash)index [memorypointer, size, top]; P=0,SIZE=1,TOP=2
-    $table['bucket'] 		// The bucket [memorypointer, size, top] 
+    $table['hash']          // The (hash)index [memorypointer, size, top]; P=0,SIZE=1,TOP=2
+    $table['bucket']        // The bucket [memorypointer, size, top] 
     $table['increment']         // To reduce memory reallocation; Increments size when top reaches size (except for $table['hash'])
     
     verify: SIZE is in bytes, but TOP is an index starting at 1, just like the pointers in the three tables; 
