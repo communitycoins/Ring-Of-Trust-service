@@ -1,4 +1,51 @@
 <?php
+/* [CC-WALLET-006]
+ROT 0.8.5 bounded non-blocking socket transport and public-command hardening.
+Base: - Derived from MULTI-COIN-017 / ROT 0.8.4
+Changes:
+- [CC-WALLET-006] Buffer partial requests and responses without blocking the single ROT loop
+- Bound client count, per-client lifetime, request/response size and total socket memory
+- Recalculate stream_select deadlines on every pass and enlarge the listen backlog
+- Restrict the public legacy socket to wallet operations and disable remote diagnostics/stop
+- Add connect and total timeouts to batched Core RPC calls
+- [MULTI-COIN-017] Accept validated single-address P2PKH output metadata when legacy Core omits scriptPubKey.hex
+- Preserve script-hex derivation as the preferred exact-output path
+- Reject missing, multi-address, wrong-network and non-pubkeyhash address fallbacks
+- [MULTI-COIN-016] Move atomic units into the ROT coin specification
+- Convert verbose Core output values with the active coin's decimal precision
+- Verify DEM mempool payments in 1,000,000 units without changing confirmed index values
+- Preserve the existing eight-decimal behavior for EFL and the other configured coins
+- [MULTI-COIN-015] Preserve getblockheader as the primary history timestamp RPC
+- Fall back only unavailable or invalid timestamp reads to coin-neutral getblock
+- Retain strict atomic history failure when neither RPC returns a valid block time
+- [EFL-SLICE-046] Pass numeric verbose mode 1 to getrawtransaction for legacy Core compatibility
+- Preserve exact mempool txid, recipient address and satoshi-amount verification
+- [EFL-SLICE-044] Return confirmed IN and external OUT history for one atomic wallet address set
+- Exclude wallet change and attach canonical block height and timestamp to every history event
+- Bound and integrity-check address walks, spending transactions and history response size
+- [EFL-SLICE-035] Require ROT_DATA_DIR separately from CORE_DATA_DIR in environment mode
+- Use the configuration-file directory as ROT storage root in config-file mode
+- Stop creating ROT runtime directories inside the Core blockchain directory
+- [EFL-SLICE-034] Bind every full and rolling backup to the exact indexed height, hash and table tops
+- Select the highest canonical rewind checkpoint instead of trusting file modification order
+- Restore orphaned spend markers, PUB last-change heights and TXO list tails during rewind
+- Stop indexing when an existing transaction id would be appended again
+- Reject cyclic, invalid or duplicate outpoints while constructing wallet state
+- [EFL-SLICE-033] Verify a known mempool txid against one exact legacy address and satoshi amount
+- [EFL-SLICE-032] Accept larger raw transactions produced by multi-tier legacy-input selection
+- [EFL-SLICE-031] Raise the atomic pubs snapshot from 32 to 51 addresses
+- [EFL-SLICE-028] Extend pubs with optional known height and per-address change heights
+- Return only changed address records while retaining the live chain checkpoint
+- Avoid walking unchanged PUB-linked TXO lists and leave delta aggregation to the wallet
+- [EFL-SLICE-026] Add bounded send and txstatus client commands.
+- Pass raw transactions to Core without constructing or signing them in ROT.
+- Return immediate structured Core acceptance, rejection and technical outcomes.
+- Calculate the transaction id independently and expose Core and ROT timings.
+- [EFL-SLICE-015] Add a generic pubs command for one consistent multi-address snapshot.
+- Return aggregate balance, per-address UTXOs and the indexed chain checkpoint as JSON.
+- Reject invalid-network, duplicate, empty and oversized address collections.
+- Keep the existing diagnostic commands unchanged and use PHP 7.3-compatible callbacks.
+*/
 
 /* Its purpose is to build a full legacy blockindex
  
@@ -37,34 +84,70 @@
   +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 */   
 
-$environment_error='';
+$environmentError='';
 $options = getopt('c:h', ['config:', 'help']);
 if (isset($options['h']) || isset($options['help'])) {die("Usage: php rot.php --config=/path/to/rot.conf\n");}
 $configFile = $options['c'] ?? $options['config'] ?? getenv('ROT_CONFIG') ?? null;
-// $configPath = $options['c'] ?? $options['config'] ?? getenv('ROT_CONFIG') ?? null;
 if ($configFile) {
-    if (!is_file($configFile)) {die("Error: config not found: $configPath\n");}
-    $parts = explode('|', trim(file_get_contents($configFile)));
+    $resolvedConfigFile=realpath($configFile);
+    if ($resolvedConfigFile===false || !is_file($resolvedConfigFile)) {die("Error: config not found: $configFile\n");}
+    $parts = explode('|', trim(file_get_contents($resolvedConfigFile)));
     if (count($parts) !== 7) {die("Error: invalid config format (expected 7 fields)\n");}
     [$tikker,$rpchost,$user,$ww,$rpcport,$socket,$datadir] = $parts;
+    $rotDataDir=dirname($resolvedConfigFile);
     if ($datadir && !is_dir($datadir)) {die("$datadir does not exist;\n");}
 } else {
-    $environment_error='';
-    $rpchost = getenv('CORE_RPC_HOST') ?: $environment_error.="CORE_RPC_HOST required;\n"; 
-    $rpcport  = getenv('CORE_RPC_PORT') ?: $environment_error.="CORE_RPC_PORT required;\n"; 
-    $user  = getenv('CORE_RPC_USER') ?: $environment_error.="CORE_RPC_USER required;\n";
-    $ww  = getenv('CORE_RPC_PASSWORD') ?: $environment_error.="CORE_RPC_PASSWORD required;\n";
-    $datadir  = getenv('CORE_DATA_DIR') ?: $environment_error.="CORE_DATA_DIR required;\n";
-    $socket  = getenv('ROT_LISTEN_ADDR') ?: $environment_error.="ROT_LISTEN_ADDR required;\n"; 
-    $tikker = getenv('ROT_COIN_TIKKER') ?: $environment_error.="ROT_COIN_TIKKER required;\n"; 
-    if (!file_exists($datadir)) {$environment_error.="$datadir does not exist;\n";}
-    if ($environment_error!=''){die($environment_error);}
+    $environmentError='';
+    $rpchost=getenv('CORE_RPC_HOST');
+    $rpcport=getenv('CORE_RPC_PORT');
+    $user=getenv('CORE_RPC_USER');
+    $ww=getenv('CORE_RPC_PASSWORD');
+    $datadir=getenv('CORE_DATA_DIR');
+    $rotDataDir=getenv('ROT_DATA_DIR');
+    $socket=getenv('ROT_LISTEN_ADDR');
+    $tikker=getenv('ROT_COIN_TIKKER');
+    if (!$rpchost) {$environmentError.="CORE_RPC_HOST required;\n";}
+    if (!$rpcport) {$environmentError.="CORE_RPC_PORT required;\n";}
+    if (!$user) {$environmentError.="CORE_RPC_USER required;\n";}
+    if (!$ww) {$environmentError.="CORE_RPC_PASSWORD required;\n";}
+    if (!$datadir) {$environmentError.="CORE_DATA_DIR required;\n";}
+    if (!$rotDataDir) {$environmentError.="ROT_DATA_DIR required;\n";}
+    if (!$socket) {$environmentError.="ROT_LISTEN_ADDR required;\n";}
+    if (!$tikker) {$environmentError.="ROT_COIN_TIKKER required;\n";}
+    if ($datadir && !is_dir($datadir)) {$environmentError.="$datadir does not exist;\n";}
+    if ($rotDataDir && !is_dir($rotDataDir)) {$environmentError.="$rotDataDir does not exist;\n";}
+    if ($environmentError!=''){die($environmentError);}
 }
 
-$configPath = $datadir."/ROT";
-if (!file_exists($configPath)) {mkdir($configPath);}
-define ("VERSION","0.2");
-define("ROOT",dirname($configPath)."/");
+$resolvedCoreDataDir=realpath($datadir);
+$resolvedRotDataDir=realpath($rotDataDir);
+if ($resolvedCoreDataDir===false) {die("Invalid Core data directory\n");}
+if ($resolvedRotDataDir===false) {die("Invalid ROT data directory\n");}
+$corePath=rtrim($resolvedCoreDataDir,"/\\");
+$rotPath=rtrim($resolvedRotDataDir,"/\\");
+if ($corePath==='') {die("Core data directory cannot be the filesystem root\n");}
+if ($rotPath==='') {die("ROT data directory cannot be the filesystem root\n");}
+$corePrefix=$corePath.DIRECTORY_SEPARATOR;
+$rotPrefix=$rotPath.DIRECTORY_SEPARATOR;
+if ($corePath===$rotPath || strpos($rotPrefix,$corePrefix)===0 || strpos($corePrefix,$rotPrefix)===0) {
+    die("CORE_DATA_DIR and ROT_DATA_DIR must be separate directory trees\n");
+}
+$datadir=$corePath;
+$rotDataDir=$rotPath;
+define ("VERSION","0.8.5");
+define ("MAX_PUBS",51);
+define ("MAX_HISTORY_EVENTS",2000);
+define ("MAX_HISTORY_WALLET_OUTPUTS",4000);
+define ("MAX_RAW_TRANSACTION_HEX",65000);
+define ("MAX_SOCKET_CLIENTS",128);
+define ("MAX_SOCKET_ACCEPTS_PER_PASS",32);
+define ("MAX_SOCKET_REQUEST_BYTES",65536);
+define ("MAX_SOCKET_RESPONSE_BYTES",2097152);
+define ("MAX_SOCKET_BUFFER_BYTES",33554432);
+define ("SOCKET_READ_TIMEOUT",5.0);
+define ("SOCKET_WRITE_TIMEOUT",10.0);
+define ("SOCKET_BACKLOG",256);
+define("ROOT",$rotDataDir."/");
 define("Q",ROOT."Q");
 define("A",ROOT."A");
 define("DATA",ROOT."data/");
@@ -76,6 +159,8 @@ if (file_exists(ROOT."DEBUG")) {define("DEBUG",true);echo "debug mode\n";} else 
 $alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 $versionsBytes = ["LTC" => 48,"BTC" => 0x00,"CDN" => 28,"DEM" => 53,"EFL" => 48,"AUR" => 23,"PAK" => 0x00,"SLG" => 0x00,"RUBTC" => 0x00,
                   "FJC" => 0x00,"BOLI" => 0x00,"CESC" => 0x00];
+$coinUnits = ["LTC" => 100000000,"BTC" => 100000000,"CDN" => 100000000,"DEM" => 1000000,"EFL" => 100000000,"AUR" => 100000000,
+              "PAK" => 100000000,"SLG" => 100000000,"RUBTC" => 100000000,"FJC" => 100000000,"BOLI" => 100000000,"CESC" => 100000000];
 function now(){return date('d-m-Y H:i');}
 function L($what){$extra="";if (($what!=".")&&(substr($what,-1)!="\n")){$extra="\n";}file_put_contents(ROOT."rot.log",$what.$extra,FILE_APPEND);echo $what.$extra;}
 if (!function_exists('array_key_last')) {function array_key_last(array $array) {if (empty($array)) {return null;}return key(array_slice($array, -1, 1, true));}}
@@ -89,7 +174,10 @@ register_shutdown_function(function(){@unlink(ROOT."pid");});
 $rpchost='127.0.0.1';
 if (strpos($rpcport,":")>0) {list($rpchost,$rpcport)=explode(":",$rpcport);}
 $tikker=strtoupper($tikker);
+if (!isset($versionsBytes[$tikker]) || !isset($coinUnits[$tikker]) || !preg_match('/^10*$/',(string)$coinUnits[$tikker])) {die("Unsupported coin specification\n");}
 $versionByte=$versionsBytes[$tikker];
+$unitsPerCoin=$coinUnits[$tikker];
+$coinDecimals=strlen((string)$unitsPerCoin)-1;
 define ("SOCKET",$socket);
 
 L("==== Start ".now()." Version ".VERSION."  $tikker ====\n\n");
@@ -138,31 +226,24 @@ $TXidx="";$TXdata="";$TX_sum=0;$BLKidx="";
 
 $recovery=false;
 if (file_exists(DATA."AUX")){ // Recover...
-    $parseContext=unserialize(file_get_contents(DATA."AUX"));
-    while (true) {
-        $hash = $RPC->call('getblockhash', [$parseContext['height']]);
-        if ($hash!==null) {break;}
-    }
-    if ($hash==$parseContext['hash']) { 
-        L("Recovering ...");
-        recover(true);
+    L("Recovering ...");
+    if (recover(true)) {
         $height=$parseContext['height']+1; // Next height to look for
+        $lastBlockHash=$parseContext['hash'];
         $recovery=true;
     } else {
-        L("Failover hash doesn't match core's vision \nRestarting ...\n");
-        $recovery=false;
+        L("Full backup is incomplete or does not match core's vision \nRestarting ...\n");
         $parseContext['currentFile']='';
         $parseContext['offset']=0;
         $parseContext['hash']='';
         $parseContext['height']=0;
-        // Oeps hoped this wouldn't occur; Start from scratch
     }
 }
 if (!$recovery){
     $parseContext['currentFile']='';
     $parseContext['offset']=0;
-    $TX_table['name']			="TX";
-    $TX_table['N']			=10000000;   // hash-positions (4-bytes a piece) -> 40Mb
+    $TX_table['name']           ="TX";
+    $TX_table['N']          =10000000;   // hash-positions (4-bytes a piece) -> 40Mb
     $TX_table['increment']              =100000000;  // increment empty space to prevent frequent reallocations (100 Mb)                                        
     if (($tikker=='LTC')||($tikker=='BTC')||($tikker=='DOGE')) {$multiplier=10;} else {$multiplier=1;}   // hash-positions -> 400Mb
     $bucketPercentage=1; // reduce memory based on history
@@ -247,7 +328,7 @@ foreach (extractBlocksFromStream() as $entry) {
     if ($raceStatus!=$raceToTheTop){
         L("Top reached at height ".($height-1)."\n");
         if (!$fullBackup) {
-            backup(true);
+            backup(true,$height-1,$lastBlockHash);
             $fullBackup=true;
         }
         $raceStatus=$raceToTheTop;
@@ -313,9 +394,7 @@ foreach (extractBlocksFromStream() as $entry) {
         
         $lastBlockHash=$entry['hash'];
         if (($height>=$BLOCKINDEX->backupHeight) && (($height%$BLOCKINDEX->maxReorgDepth)==0)) {
-            $parseContext['hash']=$entry['prevHash'];
-            $parseContext['height']=$height-1; // -1 because arriving entry isn't indexed yet
-            backup(); // No need to toutch backupHeight
+            backup(false,$height-1,$entry['prevHash']); // The arriving block is not indexed yet
         }
         $parsed = $parser->getBlock($entry['raw']);
 /// fresh parsed block        
@@ -327,7 +406,13 @@ foreach (extractBlocksFromStream() as $entry) {
             $BLKidx.=pack('vV',$entry['fileNumber'],$entry['offset']);  // pointer to block in blk*.dat (to avoid rpc getrawtransaction/txindex=1)
         }
         foreach ($parsed['transactions'] as $tx){
-            $txID=hashtable_add_TX($TX_table,[hex2bin($tx['txid']),$height,$TXO_table['bucket'][TOP]+1,0]);
+            $txHash=hex2bin($tx['txid']);
+            list($existingTxID,$existingTx)=find($TX_table,$txHash);
+            if ($existingTxID!==false && isset($existingTx[0]) && $existingTx[0]===$txHash) {
+                L("Duplicate transaction id {$tx['txid']} at height $height; index rebuild required\n");
+                die("Duplicate transaction index\n");
+            }
+            $txID=hashtable_add_TX($TX_table,[$txHash,$height,$TXO_table['bucket'][TOP]+1,0]);
             foreach ($tx['outputs'] as $output) {
                 // output(32): [0]n(4) [1]value/amount(8) [2]pubkeyhash(20)
                 // pub(36):    [0]scripthash(20) [1]blocknr/lastchange(4) [2]first-txo(4) [3]last-txo(4) [4]next hash%-collision(4)
@@ -562,221 +647,408 @@ function stripResources(array $table){ // to allow serialization
     }
     return $filtered;
 }
-function backup($full=false){
-    /* Backup occurs at $parseContext['height']. The block at that height was fully indexed
-       When you recover, start looking for the next height
+function readSerializedArray($path) {
+    if (!is_file($path)) {return false;}
+    $raw=@file_get_contents($path);
+    if ($raw===false) {return false;}
+    $value=@unserialize($raw,['allowed_classes'=>false]);
+    return is_array($value)?$value:false;
+}
+function writeSerializedArray($path,array $value) {
+    $serialized=serialize($value);
+    $written=@file_put_contents($path,$serialized,LOCK_EX);
+    return $written===strlen($serialized);
+}
+function backupTableTops() {
+    global $TX_table,$PUB_table,$TXO_table;
+    return [
+        'tx'=>(int)$TX_table['bucket'][TOP],
+        'pub'=>(int)$PUB_table['bucket'][TOP],
+        'txo'=>(int)$TXO_table['bucket'][TOP]
+    ];
+}
+function validBackupContext($context) {
+    if (!is_array($context) || !isset($context['height']) || !is_int($context['height']) || $context['height']<0) {return false;}
+    if (!isset($context['hash']) || !is_string($context['hash']) || !preg_match('/^[0-9a-f]{64}$/',$context['hash'])) {return false;}
+    if (!isset($context['currentFile']) || !is_string($context['currentFile']) || !isset($context['offset']) || !is_int($context['offset']) || $context['offset']<0) {return false;}
+    if (!isset($context['tableTops']) || !is_array($context['tableTops'])) {return false;}
+    foreach (['tx','pub','txo'] as $name) {
+        if (!isset($context['tableTops'][$name]) || !is_int($context['tableTops'][$name]) || $context['tableTops'][$name]<0) {return false;}
+    }
+    return true;
+}
+function backupPartValid($table,$part,$path) {
+    if (!is_array($table) || !isset($table[$part]) || !is_array($table[$part]) || !isset($table[$part][SIZE]) || !is_numeric($table[$part][SIZE])) {return false;}
+    $size=(int)$table[$part][SIZE];
+    if ($size<=0 || (float)$size!==(float)$table[$part][SIZE] || !is_file($path)) {return false;}
+    clearstatcache(true,$path);
+    return filesize($path)===$size;
+}
+function loadBackupCandidate($postfix,$full=false) {
+    $contextPath=$full?DATA."AUX":DATA.$postfix;
+    $context=readSerializedArray($contextPath);
+    $tx=readSerializedArray(DATA."TX_aux".($full?'':$postfix));
+    $pub=readSerializedArray(DATA."PUB_aux".($full?'':$postfix));
+    $txo=readSerializedArray(DATA."TXO_aux".($full?'':$postfix));
+    if (!validBackupContext($context) || $tx===false || $pub===false || $txo===false) {return false;}
+    if (!isset($tx['bucket'][TOP],$pub['bucket'][TOP],$txo['bucket'][TOP])) {return false;}
+    if ((int)$tx['bucket'][TOP]!==$context['tableTops']['tx'] || (int)$pub['bucket'][TOP]!==$context['tableTops']['pub'] || (int)$txo['bucket'][TOP]!==$context['tableTops']['txo']) {return false;}
+    $suffix=$full?'':$postfix;
+    if (!backupPartValid($tx,'hash',DATA."TX_hash$suffix") || !backupPartValid($pub,'hash',DATA."PUB_hash$suffix")) {return false;}
+    if ($full && (!backupPartValid($tx,'bucket',DATA."TX_bucket") || !backupPartValid($pub,'bucket',DATA."PUB_bucket") || !backupPartValid($txo,'bucket',DATA."TXO_bucket"))) {return false;}
+    return [
+        'postfix'=>$postfix,
+        'context'=>$context,
+        'tx'=>$tx,
+        'pub'=>$pub,
+        'txo'=>$txo,
+        'modified'=>(int)@filemtime($contextPath)
+    ];
+}
+function backupIsCanonical(array $candidate) {
+    global $RPC;
+    while (true) {
+        $hash=$RPC->call('getblockhash',[$candidate['context']['height']]);
+        if ($hash!==null) {break;}
+    }
+    return is_string($hash) && hash_equals($candidate['context']['hash'],$hash);
+}
+function backupPostfixForWrite() {
+    $first=loadBackupCandidate('_backup_1',false);
+    $second=loadBackupCandidate('_backup_2',false);
+    if ($first===false) {return '_backup_1';}
+    if ($second===false) {return '_backup_2';}
+    if ($first['context']['height']<$second['context']['height']) {return '_backup_1';}
+    if ($second['context']['height']<$first['context']['height']) {return '_backup_2';}
+    return @filemtime(DATA."_backup_1")<=@filemtime(DATA."_backup_2")?'_backup_1':'_backup_2';
+}
+function selectRewindBackup() {
+    $candidates=[];
+    foreach (['_backup_1','_backup_2'] as $postfix) {
+        $candidate=loadBackupCandidate($postfix,false);
+        if ($candidate===false) {
+            L("Reject incomplete rewind backup $postfix\n");
+        } elseif (backupIsCanonical($candidate)) {
+            $candidates[]=$candidate;
+        } else {
+            L("Reject non-canonical rewind backup $postfix at height {$candidate['context']['height']}\n");
+        }
+    }
+    usort($candidates,function($left,$right){
+        if ($left['context']['height']===$right['context']['height']) {return $right['modified']-$left['modified'];}
+        return $right['context']['height']-$left['context']['height'];
+    });
+    return count($candidates)>0?$candidates[0]:false;
+}
+function backup($full=false,$checkpointHeight=null,$checkpointHash=null){
+    /* The tables contain every indexed block through checkpointHeight.
+       Recovery resumes at checkpointHeight + 1.
     */
     global $TX_table,$PUB_table,$TXO_table,$parseContext;
 
+    if (!is_int($checkpointHeight) || $checkpointHeight<0 || !is_string($checkpointHash) || !preg_match('/^[0-9a-f]{64}$/',$checkpointHash)) {
+        die("Invalid backup checkpoint\n");
+    }
+    $parseContext['height']=$checkpointHeight;
+    $parseContext['hash']=$checkpointHash;
+    $parseContext['tableTops']=backupTableTops();
     $time=microtime(true);
     if (!$full) {
-        if (file_exists(DATA."_backup_1")) {$delta_1=time()-filemtime(DATA."_backup_1");} else {$delta_1=time();}
-        if (file_exists(DATA."_backup_2")) {$delta_2=time()-filemtime(DATA."_backup_2");} else {$delta_2=time();}
-        if ($delta_1>$delta_2) {$postfix="_backup_1";} else {$postfix="_backup_2";} // replace oldest
-        L("Backup $postfix at height {$parseContext['height']}: ");
-        
-        file_put_contents(DATA."TX_aux$postfix",serialize(stripResources($TX_table)));
-        file_put_contents(DATA."PUB_aux$postfix",serialize(stripResources($PUB_table)));
-        file_put_contents(DATA."TXO_aux$postfix",serialize(stripResources($TXO_table)));
-        file_put_contents(DATA."$postfix",serialize($parseContext));
-        
+        $postfix=backupPostfixForWrite();
+        L("Backup $postfix at height $checkpointHeight: ");
+        if (!writeSerializedArray(DATA."TX_aux$postfix",stripResources($TX_table)) || !writeSerializedArray(DATA."PUB_aux$postfix",stripResources($PUB_table)) || !writeSerializedArray(DATA."TXO_aux$postfix",stripResources($TXO_table))) {
+            die("Cannot write rewind backup metadata\n");
+        }
         dump_index($TX_table,"hash",DATA."TX_hash$postfix");
         dump_index($PUB_table,"hash",DATA."PUB_hash$postfix");
+        if (!backupPartValid(stripResources($TX_table),'hash',DATA."TX_hash$postfix") || !backupPartValid(stripResources($PUB_table),'hash',DATA."PUB_hash$postfix") || !writeSerializedArray(DATA.$postfix,$parseContext)) {
+            die("Incomplete rewind backup\n");
+        }
     } else {
-        L("Backup Full at height {$parseContext['height']}: ");
-        file_put_contents(DATA."AUX",serialize($parseContext));
-        file_put_contents(DATA."TX_aux",serialize(stripResources($TX_table)));
-        file_put_contents(DATA."PUB_aux",serialize(stripResources($PUB_table)));
-        file_put_contents(DATA."TXO_aux",serialize(stripResources($TXO_table)));
+        L("Backup Full at height $checkpointHeight: ");
+        if (!writeSerializedArray(DATA."TX_aux",stripResources($TX_table)) || !writeSerializedArray(DATA."PUB_aux",stripResources($PUB_table)) || !writeSerializedArray(DATA."TXO_aux",stripResources($TXO_table))) {
+            die("Cannot write full backup metadata\n");
+        }
         dump_index($TX_table,"hash",DATA."TX_hash");
         dump_index($PUB_table,"hash",DATA."PUB_hash");
         dump_index($TX_table,"bucket",DATA."TX_bucket");
         dump_index($PUB_table,"bucket",DATA."PUB_bucket");
         dump_index($TXO_table,"bucket",DATA."TXO_bucket");
+        $valid=backupPartValid(stripResources($TX_table),'hash',DATA."TX_hash") && backupPartValid(stripResources($PUB_table),'hash',DATA."PUB_hash") && backupPartValid(stripResources($TX_table),'bucket',DATA."TX_bucket") && backupPartValid(stripResources($PUB_table),'bucket',DATA."PUB_bucket") && backupPartValid(stripResources($TXO_table),'bucket',DATA."TXO_bucket");
+        if (!$valid || !writeSerializedArray(DATA."AUX",$parseContext)) {die("Incomplete full backup\n");}
     }
     L((microtime(true)-$time)."(s)\n");
 }
-function recover($full=false) { // Rewinds to a valid backup-tip
-    global $TX_table,$PUB_table,$TXO_table,$parseContext,$RPC;  
+function restoreAffectedPub($pubIndex,$backupTxTop,$backupPubTop,$backupTxoTop) {
+    global $TX_table,$PUB_table,$TXO_table;
+
+    if ($pubIndex<1 || $pubIndex>$backupPubTop) {die("Invalid affected PUB index\n");}
+    $pub=hashtable_read($PUB_table['bucket'],$pubIndex);
+    $txoIndex=$pub[2];
+    $visited=[];
+    $lastTxo=0;
+    $lastChangeHeight=0;
+    while (true) {
+        if ($txoIndex<1 || $txoIndex>$backupTxoTop || isset($visited[$txoIndex])) {die("Broken TXO linked list during rewind\n");}
+        $visited[$txoIndex]=true;
+        $txo=hashtable_read($TXO_table['bucket'],$txoIndex);
+        if ($txo[3]!==$pubIndex || $txo[0]<1 || $txo[0]>$backupTxTop) {die("Invalid TXO ownership during rewind\n");}
+        $tx=hashtable_read($TX_table['bucket'],$txo[0]);
+        $lastChangeHeight=max($lastChangeHeight,(int)$tx[1]);
+        if ($txo[4]!==0) {
+            if ($txo[4]<1 || $txo[4]>$backupTxTop) {die("Invalid spend pointer during rewind\n");}
+            $spend=hashtable_read($TX_table['bucket'],$txo[4]);
+            $lastChangeHeight=max($lastChangeHeight,(int)$spend[1]);
+        }
+        $lastTxo=$txoIndex;
+        $next=(int)$txo[5];
+        if ($next>$TXO_table['bucket'][TOP]) {die("TXO pointer beyond live index during rewind\n");}
+        if ($next===0 || $next>$backupTxoTop) {
+            if ($next>$backupTxoTop) {
+                $txo[5]=0;
+                hashtable_write($TXO_table['bucket'],$txoIndex,$txo);
+            }
+            break;
+        }
+        $txoIndex=$next;
+    }
+    $pub[1]=$lastChangeHeight;
+    $pub[3]=$lastTxo;
+    hashtable_write($PUB_table['bucket'],$pubIndex,$pub);
+}
+function repairCollisionPointers(&$table,$pointerIndex) {
+    $top=$table['bucket'][TOP];
+    for ($i=1;$i<=$top;$i++) {
+        $content=hashtable_read($table['bucket'],$i);
+        if ($content[$pointerIndex]>$top) {
+            $content[$pointerIndex]=0;
+            hashtable_write($table['bucket'],$i,$content);
+        }
+    }
+}
+function restoreTableKeys() {
+    global $TX_table,$PUB_table,$TXO_table;
+    $TX_table['hash'][KEY]=ftok(__FILE__,'A');
+    $TX_table['bucket'][KEY]=ftok(__FILE__,'B');
+    $PUB_table['hash'][KEY]=ftok(__FILE__,'C');
+    $PUB_table['bucket'][KEY]=ftok(__FILE__,'D');
+    $TXO_table['bucket'][KEY]=ftok(__FILE__,'E');
+}
+function recover($full=false) { // Rewinds to the highest complete canonical backup-tip
+    global $TX_table,$PUB_table,$TXO_table,$parseContext;
     $time=microtime(true);
 
     if ($full) {
-        $parseContext=unserialize(file_get_contents(DATA."AUX"));
-        L("Recover Full till height ".$parseContext['height']."\n");
-        $TX_table=unserialize(file_get_contents(DATA."TX_aux"));
-        $PUB_table=unserialize(file_get_contents(DATA."PUB_aux"));
-        $TXO_table=unserialize(file_get_contents(DATA."TXO_aux"));
+        $candidate=loadBackupCandidate('',true);
+        if ($candidate===false || !backupIsCanonical($candidate)) {return false;}
+        $parseContext=$candidate['context'];
+        $TX_table=$candidate['tx'];
+        $PUB_table=$candidate['pub'];
+        $TXO_table=$candidate['txo'];
+        restoreTableKeys();
+        L("Recover Full till height {$parseContext['height']}\n");
         hashtable_initialize($TX_table['hash']);
         hashtable_initialize($TX_table['bucket']);
         hashtable_initialize($PUB_table['hash']);
         hashtable_initialize($PUB_table['bucket']);
-        hashtable_initialize($TXO_table['bucket']);    
+        hashtable_initialize($TXO_table['bucket']);
         load_index($TX_table,'hash',DATA."TX_hash");
         load_index($PUB_table,'hash',DATA."PUB_hash");
         load_index($TX_table,'bucket',DATA."TX_bucket");
         load_index($PUB_table,'bucket',DATA."PUB_bucket");
         load_index($TXO_table,'bucket',DATA."TXO_bucket");
-    } else {
-        if (file_exists(DATA."_backup_1")) {$delta_1=time()-filemtime(DATA."_backup_1");} else {$delta_1=time();}
-        if (file_exists(DATA."_backup_2")) {$delta_2=time()-filemtime(DATA."_backup_2");} else {$delta_2=time();}
-        if ($delta_1>$delta_2) {$postfix="_backup_2";} else {$postfix="_backup_1";} // try youngest first
-        L("Recover $postfix at height {$parseContext['height']}\n");
-    
-        $parseContext=unserialize(file_get_contents(DATA.$postfix));
-        while (true) {
-            $hash = $RPC->call('getblockhash', [$parseContext['height']]);
-            if ($hash!==null) {break;}
-        }
-        if ($hash!=$parseContext['hash']) { // rewind deeper
-            if ($postfix=="_backup_1") {$postfix="_backup_2";} else {$postfix="_backup_1";}
-            $parseContext=json_decode(file_get_contents(DATA.$postfix),true);
-            while (true) {
-                $hash = $RPC->call('getblockhash', [$parseContext['height']]);
-                if ($hash!==null) {break;}
-            }
-            if ($hash!=$parseContext['hash']) { // Oeps hoped this wouldn't occur; Both backups dont conform. Try latest Full backup
-                $parseContext=unserialize(file_get_contents(DATA."AUX"));
-                if ($hash!=$parseContext['hash']) {                    
-                    die("Cannot recover from backup at height {$parseContext['height']}\n Try full recovery (remove contents of data-directory).");
-                } else {
-                    recover(true);
-                    return;
-                }
-            }
-        }
+        return true;
+    }
 
-        $TX_table_backup=unserialize(file_get_contents(DATA."TX_aux".$postfix));
-        $PUB_table_backup=unserialize(file_get_contents(DATA."PUB_aux".$postfix));
-        $TXO_table_backup=unserialize(file_get_contents(DATA."TXO_aux".$postfix));
+    $candidate=selectRewindBackup();
+    if ($candidate===false) {
+        L("No canonical rewind backup; trying full backup\n");
+        if (!recover(true)) {die("No complete canonical backup available; index rebuild required\n");}
+        return true;
+    }
+    $parseContext=$candidate['context'];
+    $postfix=$candidate['postfix'];
+    $backupTxTop=$candidate['tx']['bucket'][TOP];
+    $backupPubTop=$candidate['pub']['bucket'][TOP];
+    $backupTxoTop=$candidate['txo']['bucket'][TOP];
+    $currentTxTop=$TX_table['bucket'][TOP];
+    $currentPubTop=$PUB_table['bucket'][TOP];
+    $currentTxoTop=$TXO_table['bucket'][TOP];
+    if ($backupTxTop>$currentTxTop || $backupPubTop>$currentPubTop || $backupTxoTop>$currentTxoTop) {die("Rewind backup is ahead of live indexes\n");}
+    L("Recover $postfix till height {$parseContext['height']}\n");
 
-        hashtable_initialize($TX_table['hash']);
-        hashtable_initialize($PUB_table['hash']);
-        load_index($TX_table,'hash',DATA."TX_hash$postfix");
-        load_index($PUB_table,'hash',DATA."PUB_hash$postfix");
-        
-        $truncTXOEnd  =$TXO_table['bucket'][TOP];
-        $truncTXOStart=$TXO_table_backup['bucket'][TOP]+1;
-        $truncPUBstart=$PUB_table_backup['bucket'][TOP]+1;
-        if (DEBUG) {L("$truncTXOStart,$truncTXOEnd,$truncPUBstart\n");}
-        $affected=[];
-        for ($i=$truncTXOStart;$i<=$truncTXOEnd;$i++) {
-            $content=hashtable_read($TXO_table['bucket'],$i);
-            if ($content[3]<$truncPUBstart) {$affected[$content[3]]=true;}
-        }
-        L((1+$truncTXOEnd-$truncTXOStart)." txo's concerned; ".count($affected)." pubkeys affected.\n");
-        foreach ($affected as $PUB_index=>$dummy){
-            $PUB_content=hashtable_read($PUB_table['bucket'],$PUB_index);
-            $more=true;
-            $TXO_index=$PUB_content[2];  // first
-            while ($more) {
-                $TXO_content=hashtable_read($TXO_table['bucket'],$TXO_index);
-                if ($TXO_content[5]==0) {
-                    L('Broken TXO-linked list');
-                    die();
-                } elseif ($TXO_content[5]>=$truncTXOStart) {
-                    $more=false;
-                    $PUB_content[3]=$TXO_index;
-                    hashtable_write($PUB_table['bucket'],$PUB_index,$PUB_content);
-                    $TXO_content[5]=0;
-                    hashtable_write($TXO_table['bucket'],$TXO_index,$TXO_content);
-                } else {
-                    $TXO_index=$TXO_content[5];  // next
-                }
-            }            
-        }
-        $TX_table['bucket'][TOP]=$TX_table_backup['bucket'][TOP];
-        $PUB_table['bucket'][TOP]=$PUB_table_backup['bucket'][TOP];
-        $TXO_table['bucket'][TOP]=$TXO_table_backup['bucket'][TOP];
-        // trunc TX_table; ($i=1 Can be optimized by finding the first transaction at blockheight==backup[TOP])
-        $collisionPointer=3;
-        $top=$TX_table['bucket'][TOP];
-        for ($i=1;$i<=$top;$i++) {
-            $content=hashtable_read($TX_table['bucket'],$i);
-            if ($content[$collisionPointer]>$top) {
-               $content[$collisionPointer]=0;
-               hashtable_write($TX_table['bucket'],$i,$content);
-            } 
-        }
-        // trunc PUB_table
-        $collisionPointer=4;
-        $top=$PUB_table['bucket'][TOP];
-        for ($i=1;$i<=$top;$i++) {
-            $content=hashtable_read($PUB_table['bucket'],$i);
-            if ($content[$collisionPointer]>$top) {
-               $content[$collisionPointer]=0;
-               hashtable_write($PUB_table['bucket'],$i,$content);
-            } 
+    hashtable_initialize($TX_table['hash']);
+    hashtable_initialize($PUB_table['hash']);
+    load_index($TX_table,'hash',DATA."TX_hash$postfix");
+    load_index($PUB_table,'hash',DATA."PUB_hash$postfix");
+
+    $affected=[];
+    for ($i=$backupTxoTop+1;$i<=$currentTxoTop;$i++) {
+        $txo=hashtable_read($TXO_table['bucket'],$i);
+        if ($txo[3]<1 || $txo[3]>$currentPubTop) {die("Invalid PUB pointer in removed TXO\n");}
+        if ($txo[3]>=1 && $txo[3]<=$backupPubTop) {$affected[$txo[3]]=true;}
+    }
+    for ($i=1;$i<=$backupTxoTop;$i++) {
+        $txo=hashtable_read($TXO_table['bucket'],$i);
+        if ($txo[4]>$currentTxTop) {die("Spend pointer beyond live TX index\n");}
+        if ($txo[4]>$backupTxTop) {
+            $txo[4]=0;
+            hashtable_write($TXO_table['bucket'],$i,$txo);
+            if ($txo[3]>=1 && $txo[3]<=$backupPubTop) {$affected[$txo[3]]=true;}
         }
     }
+    foreach ($affected as $pubIndex=>$dummy) {restoreAffectedPub($pubIndex,$backupTxTop,$backupPubTop,$backupTxoTop);}
+
+    $TX_table['bucket'][TOP]=$backupTxTop;
+    $PUB_table['bucket'][TOP]=$backupPubTop;
+    $TXO_table['bucket'][TOP]=$backupTxoTop;
+    repairCollisionPointers($TX_table,3);
+    repairCollisionPointers($PUB_table,4);
+    L(($currentTxoTop-$backupTxoTop)." txo's removed; ".count($affected)." pubkeys restored; ".(microtime(true)-$time)."(s)\n");
+    backup(true,$parseContext['height'],$parseContext['hash']);
+    return true;
 }
+function closeSocketClient(array &$clients,$id,&$bufferedBytes) {
+    if (!isset($clients[$id])) {return;}
+    $client=$clients[$id];
+    $remainingOutput=max(0,strlen($client['output'])-$client['outputOffset']);
+    $bufferedBytes=max(0,$bufferedBytes-strlen($client['input'])-$remainingOutput);
+    if (is_resource($client['socket'])) {fclose($client['socket']);}
+    unset($clients[$id]);
+}
+
 function handleSocketRequests(float $deadline){
-    global $alphabet;
-    static $clients = [];
+    static $clients=[];
     static $server;
-    static $rot=[];
-    static $network=[];
-    
-    if ($network === null) {
-    }
-    
-    if ($server === null) {
-        if (!file_exists(DATA.'rot')) {
-            //$rot['auth']="";
-            //for ($i=0;$i<32;$i++) {$rot['auth'].=$alphabet[mt_rand(0,57)];}
-            ////$rot['candidates']=parse_peers_dat();
-            ////$rot['candidateBatch']=time();
-        }
-        $server = stream_socket_server("tcp://0.0.0.0:".SOCKET, $errno, $errstr);
+    static $bufferedBytes=0;
+
+    if ($server===null) {
+        $context=stream_context_create(['socket'=>['backlog'=>SOCKET_BACKLOG]]);
+        $server=stream_socket_server(
+            "tcp://0.0.0.0:".SOCKET,
+            $errno,
+            $errstr,
+            STREAM_SERVER_BIND|STREAM_SERVER_LISTEN,
+            $context
+        );
         if (!$server) {die("Socket error: $errstr ($errno)");}
-        stream_set_blocking($server, false);
+        stream_set_blocking($server,false);
     }
-    $write  = null;
-    $except = null;
-    $timeout_sec=0;
-    while (microtime(true) < $deadline) {
-        $read = $clients;
-        $read[] = $server;
 
-        $remainingTime = $deadline - microtime(true);
-        if ($remainingTime <= 0) break;
-
-        $timeout_usec = (int) floor(($remainingTime - $timeout_sec) * 1000000);
-        if ($timeout_usec > 999999) { $timeout_sec += 1; $timeout_usec = 0; } // guard
-        
-        $ready = @stream_select($read, $write, $except, $timeout_sec, $timeout_usec); 
-        if ($ready === false) {
-            $err = error_get_last();
-            if (strpos($err['message'] ?? '', 'Interrupted system call') !== false) {
-                continue; // harmless
+    while (microtime(true)<$deadline) {
+        $now=microtime(true);
+        $read=[$server];
+        $write=[];
+        $except=null;
+        $waitUntil=$deadline;
+        foreach ($clients as $id=>$client) {
+            if ($client['output']==='') {
+                $read[$id]=$client['socket'];
+                $waitUntil=min($waitUntil,$client['readDeadline']);
+            } else {
+                $write[$id]=$client['socket'];
+                $waitUntil=min($waitUntil,$client['writeDeadline']);
             }
-            L("stream_select failed: " . $err['message']);
+        }
+        $remaining=max(0.0,$waitUntil-$now);
+        $timeoutSec=(int)floor($remaining);
+        $timeoutUsec=(int)floor(($remaining-$timeoutSec)*1000000);
+        $ready=@stream_select($read,$write,$except,$timeoutSec,$timeoutUsec);
+        if ($ready===false) {
+            $err=error_get_last();
+            $message=is_array($err) && isset($err['message'])?$err['message']:'unknown stream_select error';
+            if (strpos($message,'Interrupted system call')!==false) {continue;}
+            L("stream_select failed: ".$message);
             break;
         }
 
         foreach ($read as $sock) {
-            if ($sock === $server) {
-                $client = stream_socket_accept($server, 0);
-                if ($client) {
-                    stream_set_blocking($client, false);
-                    $clients[] = $client;
+            if ($sock===$server) {
+                $acceptedThisPass=0;
+                while ($acceptedThisPass<MAX_SOCKET_ACCEPTS_PER_PASS && ($client=@stream_socket_accept($server,0))!==false) {
+                    $acceptedThisPass++;
+                    if (count($clients)>=MAX_SOCKET_CLIENTS || $bufferedBytes>=MAX_SOCKET_BUFFER_BYTES) {
+                        fclose($client);
+                        continue;
+                    }
+                    stream_set_blocking($client,false);
+                    $id=(int)$client;
+                    $accepted=microtime(true);
+                    $clients[$id]=[
+                        'socket'=>$client,
+                        'input'=>'',
+                        'output'=>'',
+                        'outputOffset'=>0,
+                        'readDeadline'=>$accepted+SOCKET_READ_TIMEOUT,
+                        'writeDeadline'=>0.0
+                    ];
                 }
-            } else {
-                $line = stream_get_line($sock, 65536, "\n");
-                $meta = stream_get_meta_data($sock);
-                if ($meta['timed_out'] || $line === false || feof($sock)) {
-                    fclose($sock);
-                    if (DEBUG) {echo "socket issue...\n";}
-                    $clients = array_filter($clients, fn($c) => $c !== $sock);
-                } else {
-                    if (DEBUG) {echo "$line\n";}
-                    $response = handleClientRequest($line);
-                    fwrite($sock, $response . "\n");
-                    fflush($sock);
-                    fclose($sock);
-                    if (DEBUG) {echo "$response\n";}
-                    $clients = array_filter($clients, fn($c) => $c !== $sock);
-                }
+                continue;
             }
+            $id=(int)$sock;
+            if (!isset($clients[$id]) || $clients[$id]['output']!=='') {continue;}
+            $chunk=@fread($sock,8192);
+            if ($chunk===false || ($chunk==='' && feof($sock))) {
+                closeSocketClient($clients,$id,$bufferedBytes);
+                continue;
+            }
+            if ($chunk==='') {continue;}
+            $clients[$id]['input'].=$chunk;
+            $bufferedBytes+=strlen($chunk);
+            if (strlen($clients[$id]['input'])>MAX_SOCKET_REQUEST_BYTES || $bufferedBytes>MAX_SOCKET_BUFFER_BYTES) {
+                closeSocketClient($clients,$id,$bufferedBytes);
+                continue;
+            }
+            $newline=strpos($clients[$id]['input'],"\n");
+            if ($newline===false) {continue;}
+            $line=substr($clients[$id]['input'],0,$newline);
+            $trailing=substr($clients[$id]['input'],$newline+1);
+            if (trim($trailing)!=='') {
+                closeSocketClient($clients,$id,$bufferedBytes);
+                continue;
+            }
+            if (DEBUG) {echo $line."\n";}
+            $response=handleClientRequest($line)."\n";
+            $bufferedBytes-=strlen($clients[$id]['input']);
+            $clients[$id]['input']='';
+            if (strlen($response)>MAX_SOCKET_RESPONSE_BYTES || $bufferedBytes+strlen($response)>MAX_SOCKET_BUFFER_BYTES) {
+                closeSocketClient($clients,$id,$bufferedBytes);
+                continue;
+            }
+            $clients[$id]['output']=$response;
+            $clients[$id]['outputOffset']=0;
+            $clients[$id]['writeDeadline']=microtime(true)+SOCKET_WRITE_TIMEOUT;
+            $bufferedBytes+=strlen($response);
+            $write[$id]=$sock;
+            if (DEBUG) {echo $response;}
+        }
+
+        foreach ($write as $sock) {
+            $id=(int)$sock;
+            if (!isset($clients[$id]) || $clients[$id]['output']==='') {continue;}
+            $remainingOutput=strlen($clients[$id]['output'])-$clients[$id]['outputOffset'];
+            $chunk=substr($clients[$id]['output'],$clients[$id]['outputOffset'],min(65536,$remainingOutput));
+            $written=@fwrite($sock,$chunk);
+            if ($written===false) {
+                closeSocketClient($clients,$id,$bufferedBytes);
+                continue;
+            }
+            if ($written>0) {
+                $clients[$id]['outputOffset']+=$written;
+                $bufferedBytes=max(0,$bufferedBytes-$written);
+            }
+            if ($clients[$id]['outputOffset']>=strlen($clients[$id]['output'])) {
+                closeSocketClient($clients,$id,$bufferedBytes);
+            }
+        }
+
+        $now=microtime(true);
+        foreach (array_keys($clients) as $id) {
+            if (!isset($clients[$id])) {continue;}
+            $expired=$clients[$id]['output']===''
+                ?$now>=$clients[$id]['readDeadline']
+                :$now>=$clients[$id]['writeDeadline'];
+            if ($expired) {closeSocketClient($clients,$id,$bufferedBytes);}
         }
     }
 }
@@ -836,6 +1108,596 @@ function parse_peers_dat() {
     return $peers;
 }
 
+function encodePubsResponse(array $response) {
+    $json=json_encode($response,JSON_UNESCAPED_SLASHES);
+    if ($json===false) {
+        return '{"ok":false,"error":"JSON_ENCODE_FAILED"}';
+    }
+    return $json;
+}
+function pubsError($id,$error) {
+    return encodePubsResponse([
+        'ok'=>false,
+        'id'=>$id,
+        'error'=>$error
+    ]);
+}
+function transactionIdFromRaw($rawHex) {
+    $binary=hex2bin($rawHex);
+    if ($binary===false) {
+        return false;
+    }
+    return bin2hex(strrev(hash('sha256',hash('sha256',$binary,true),true)));
+}
+function sendResponse($id,$ok,$status,$txid,$fields=[]) {
+    global $tikker;
+
+    $response=[
+        'ok'=>$ok,
+        'id'=>$id,
+        'coin'=>$tikker,
+        'technical'=>false,
+        'status'=>$status,
+        'txid'=>$txid
+    ];
+    foreach ($fields as $key=>$value) {
+        $response[$key]=$value;
+    }
+    return encodePubsResponse($response);
+}
+function handleSendRequest($id,$rawHex) {
+    global $RPC;
+
+    $started=microtime(true);
+    if (!is_string($id) || $id==='' || strlen($id)>64) {
+        return sendResponse($id,false,'REJECTED',null,['error'=>'INVALID_ID','rotMs'=>(int)round((microtime(true)-$started)*1000)]);
+    }
+    if (!is_string($rawHex) || strlen($rawHex)<20 || strlen($rawHex)>MAX_RAW_TRANSACTION_HEX || (strlen($rawHex)%2)!==0 || !ctype_xdigit($rawHex)) {
+        return sendResponse($id,false,'REJECTED',null,['error'=>'INVALID_RAW_TRANSACTION','rotMs'=>(int)round((microtime(true)-$started)*1000)]);
+    }
+
+    $rawHex=strtolower($rawHex);
+    $localTxid=transactionIdFromRaw($rawHex);
+    if ($localTxid===false) {
+        return sendResponse($id,false,'REJECTED',null,['error'=>'INVALID_RAW_TRANSACTION','rotMs'=>(int)round((microtime(true)-$started)*1000)]);
+    }
+
+    $core=$RPC->callResult('sendrawtransaction',[$rawHex]);
+    $timing=['coreMs'=>$core['durationMs'],'rotMs'=>(int)round((microtime(true)-$started)*1000)];
+    if ($core['technical']) {
+        return sendResponse($id,false,'UNAVAILABLE',$localTxid,array_merge($timing,['technical'=>true,'error'=>$core['error']]));
+    }
+    if (!$core['ok']) {
+        $message=(string)$core['rpcMessage'];
+        $alreadyKnown=($core['rpcCode']===-27)||preg_match('/already/i',$message);
+        if ($alreadyKnown) {
+            return sendResponse($id,true,'KNOWN',$localTxid,array_merge($timing,['accepted'=>true]));
+        }
+        return sendResponse($id,false,'REJECTED',$localTxid,array_merge($timing,[
+            'accepted'=>false,
+            'rpcCode'=>$core['rpcCode'],
+            'rpcMessage'=>$message
+        ]));
+    }
+
+    $coreTxid=is_string($core['result'])?strtolower($core['result']):'';
+    if (!preg_match('/^[0-9a-f]{64}$/',$coreTxid) || !hash_equals($localTxid,$coreTxid)) {
+        return sendResponse($id,false,'UNAVAILABLE',$localTxid,array_merge($timing,['technical'=>true,'error'=>'CORE_TXID_MISMATCH']));
+    }
+    return sendResponse($id,true,'ACCEPTED',$localTxid,array_merge($timing,['accepted'=>true]));
+}
+function handleTransactionStatusRequest($id,$txid) {
+    global $RPC,$height,$lastBlockHash,$TX_table;
+
+    $started=microtime(true);
+    if (!is_string($id) || $id==='' || strlen($id)>64 || !is_string($txid) || !preg_match('/^[0-9a-fA-F]{64}$/',$txid)) {
+        return sendResponse($id,false,'REJECTED',null,['error'=>'INVALID_TRANSACTION_ID','rotMs'=>(int)round((microtime(true)-$started)*1000)]);
+    }
+    $txid=strtolower($txid);
+    list($index,$record)=find($TX_table,hex2bin($txid));
+    if ($index!==false && isset($record[0]) && bin2hex($record[0])===$txid) {
+        $blockHeight=(int)$record[1];
+        return sendResponse($id,true,'CONFIRMED',$txid,[
+            'confirmed'=>true,
+            'blockHeight'=>$blockHeight,
+            'confirmations'=>max(1,$height-$blockHeight),
+            'height'=>max(0,$height-1),
+            'blockHash'=>$lastBlockHash,
+            'coreMs'=>0,
+            'rotMs'=>(int)round((microtime(true)-$started)*1000)
+        ]);
+    }
+
+    $core=$RPC->callResult('getrawmempool',[]);
+    $timing=['coreMs'=>$core['durationMs'],'rotMs'=>(int)round((microtime(true)-$started)*1000)];
+    if ($core['technical'] || !$core['ok'] || !is_array($core['result'])) {
+        return sendResponse($id,false,'UNAVAILABLE',$txid,array_merge($timing,['technical'=>true,'error'=>'CORE_STATUS_UNAVAILABLE']));
+    }
+    if (in_array($txid,$core['result'],true)) {
+        return sendResponse($id,true,'MEMPOOL',$txid,array_merge($timing,['confirmed'=>false]));
+    }
+    return sendResponse($id,true,'UNKNOWN',$txid,array_merge($timing,['confirmed'=>false]));
+}
+function coinValueToAtomicUnits($value) {
+    global $unitsPerCoin,$coinDecimals;
+
+    if (!is_int($value) && !is_float($value) && !is_string($value)) {
+        return false;
+    }
+    $pattern='/^(0|[1-9][0-9]*)(\.[0-9]{1,'.$coinDecimals.'})?$/';
+    if (is_string($value) && !preg_match($pattern,$value)) {
+        return false;
+    }
+    $decimal=is_string($value)?$value:number_format($value,$coinDecimals,'.','');
+    $parts=explode('.',$decimal,2);
+    $whole=$parts[0];
+    $fraction=isset($parts[1])?str_pad($parts[1],$coinDecimals,'0'):str_repeat('0',$coinDecimals);
+    if (strlen($fraction)>$coinDecimals || strlen($whole)>10) {
+        return false;
+    }
+    $units=((int)$whole)*$unitsPerCoin+(int)$fraction;
+    return $units>=0?$units:false;
+}
+function coreP2pkhOutputAddress(array $output) {
+    global $versionByte;
+
+    if (!isset($output['scriptPubKey']) || !is_array($output['scriptPubKey'])) {
+        return false;
+    }
+    $script=$output['scriptPubKey'];
+    if (array_key_exists('hex',$script)) {
+        if (!is_string($script['hex']) || !preg_match('/^76a914([0-9a-fA-F]{40})88ac$/',$script['hex'],$matches)) {
+            return false;
+        }
+        return address_from_pubkeyhash(hex2bin($matches[1]));
+    }
+    if (!isset($script['type']) || $script['type']!=='pubkeyhash' || !isset($script['addresses']) || !is_array($script['addresses']) || count($script['addresses'])!==1 || !is_string($script['addresses'][0])) {
+        return false;
+    }
+    $address=$script['addresses'][0];
+    $payload=base58check_decode($address);
+    if ($payload===false || strlen($payload)!==21 || ord($payload[0])!==$versionByte) {
+        return false;
+    }
+    return $address;
+}
+function handleZeroConfirmationRequest($id,$parameters) {
+    global $RPC,$height,$lastBlockHash,$TX_table,$TXO_table,$PUB_table,$versionByte;
+
+    $started=microtime(true);
+    $parts=explode(',',$parameters);
+    if (!is_string($id) || $id==='' || strlen($id)>64 || count($parts)!==3) {
+        return sendResponse($id,false,'REJECTED',null,['address'=>'','amountSats'=>0,'error'=>'INVALID_PAYMENT_RECEIPT','rotMs'=>(int)round((microtime(true)-$started)*1000)]);
+    }
+    list($txid,$address,$amountText)=$parts;
+    $payload=base58check_decode($address);
+    if (!preg_match('/^[0-9a-fA-F]{64}$/',$txid) || $payload===false || strlen($payload)!==21 || ord($payload[0])!==$versionByte || !preg_match('/^[1-9][0-9]*$/',$amountText)) {
+        return sendResponse($id,false,'REJECTED',preg_match('/^[0-9a-fA-F]{64}$/',$txid)?strtolower($txid):null,['address'=>$address,'amountSats'=>(int)$amountText,'error'=>'INVALID_PAYMENT_RECEIPT','rotMs'=>(int)round((microtime(true)-$started)*1000)]);
+    }
+    $txid=strtolower($txid);
+    $amountSats=(int)$amountText;
+    if ($amountSats<=0) {
+        return sendResponse($id,false,'REJECTED',$txid,['address'=>$address,'amountSats'=>$amountSats,'error'=>'INVALID_PAYMENT_RECEIPT','rotMs'=>(int)round((microtime(true)-$started)*1000)]);
+    }
+
+    list($index,$record)=find($TX_table,hex2bin($txid));
+    if ($index!==false && isset($record[0]) && bin2hex($record[0])===$txid) {
+        $blockHeight=(int)$record[1];
+        $matched=false;
+        $offset=0;
+        while ($record[2]+$offset<=$TXO_table['bucket'][TOP]) {
+            $txo=hashtable_read($TXO_table['bucket'],$record[2]+$offset);
+            if ($txo[0]!==$index) {break;}
+            $pub=hashtable_read($PUB_table['bucket'],$txo[3]);
+            if (address_from_pubkeyhash($pub[0])===$address && (int)$txo[2]===$amountSats) {$matched=true;break;}
+            $offset++;
+        }
+        if (!$matched) {
+            return sendResponse($id,false,'OUTPUT_MISMATCH',$txid,[
+                'address'=>$address,
+                'amountSats'=>$amountSats,
+                'confirmed'=>true,
+                'blockHeight'=>$blockHeight,
+                'confirmations'=>max(1,$height-$blockHeight),
+                'height'=>max(0,$height-1),
+                'blockHash'=>$lastBlockHash,
+                'coreMs'=>0,
+                'rotMs'=>(int)round((microtime(true)-$started)*1000)
+            ]);
+        }
+        return sendResponse($id,true,'CONFIRMED',$txid,[
+            'address'=>$address,
+            'amountSats'=>$amountSats,
+            'confirmed'=>true,
+            'blockHeight'=>$blockHeight,
+            'confirmations'=>max(1,$height-$blockHeight),
+            'height'=>max(0,$height-1),
+            'blockHash'=>$lastBlockHash,
+            'coreMs'=>0,
+            'rotMs'=>(int)round((microtime(true)-$started)*1000)
+        ]);
+    }
+
+    $mempool=$RPC->callResult('getrawmempool',[]);
+    if ($mempool['technical'] || !$mempool['ok'] || !is_array($mempool['result'])) {
+        return sendResponse($id,false,'UNAVAILABLE',$txid,['technical'=>true,'address'=>$address,'amountSats'=>$amountSats,'error'=>'CORE_MEMPOOL_UNAVAILABLE','coreMs'=>$mempool['durationMs'],'rotMs'=>(int)round((microtime(true)-$started)*1000)]);
+    }
+    if (!in_array($txid,$mempool['result'],true)) {
+        return sendResponse($id,true,'NOT_SEEN',$txid,['address'=>$address,'amountSats'=>$amountSats,'confirmed'=>false,'coreMs'=>$mempool['durationMs'],'rotMs'=>(int)round((microtime(true)-$started)*1000)]);
+    }
+
+    $decoded=$RPC->callResult('getrawtransaction',[$txid,1]);
+    $coreMs=$mempool['durationMs']+$decoded['durationMs'];
+    if ($decoded['technical'] || !$decoded['ok'] || !is_array($decoded['result']) || !isset($decoded['result']['txid']) || strtolower((string)$decoded['result']['txid'])!==$txid || !isset($decoded['result']['vout']) || !is_array($decoded['result']['vout'])) {
+        return sendResponse($id,false,'UNAVAILABLE',$txid,['technical'=>true,'address'=>$address,'amountSats'=>$amountSats,'error'=>'CORE_TRANSACTION_UNAVAILABLE','coreMs'=>$coreMs,'rotMs'=>(int)round((microtime(true)-$started)*1000)]);
+    }
+    $matched=false;
+    foreach ($decoded['result']['vout'] as $output) {
+        if (!is_array($output) || !array_key_exists('value',$output)) {continue;}
+        $outputAddress=coreP2pkhOutputAddress($output);
+        if ($outputAddress===false) {continue;}
+        $outputSats=coinValueToAtomicUnits($output['value']);
+        if ($outputAddress===$address && $outputSats===$amountSats) {$matched=true;break;}
+    }
+    if (!$matched) {
+        return sendResponse($id,false,'OUTPUT_MISMATCH',$txid,['address'=>$address,'amountSats'=>$amountSats,'confirmed'=>false,'coreMs'=>$coreMs,'rotMs'=>(int)round((microtime(true)-$started)*1000)]);
+    }
+    return sendResponse($id,true,'SEEN',$txid,['address'=>$address,'amountSats'=>$amountSats,'confirmed'=>false,'coreMs'=>$coreMs,'rotMs'=>(int)round((microtime(true)-$started)*1000)]);
+}
+function parseUnsignedHeight($value,&$parsed) {
+    if (!is_string($value) || strlen($value)>10 || !preg_match('/^(0|[1-9][0-9]*)$/',$value)) {
+        return false;
+    }
+    $parsed=(int)$value;
+    return $parsed>=0 && (string)$parsed===$value;
+}
+function parsePubsParameters($params,&$parts,&$knownHeight,&$knownChanges,&$error) {
+    $sections=explode(';',$params);
+    $knownHeight=null;
+    $knownChanges=null;
+    if (count($sections)===1) {
+        $parts=explode(',',$sections[0]);
+        return true;
+    }
+    if (count($sections)!==3 || !parseUnsignedHeight($sections[0],$knownHeight)) {
+        $error='INVALID_KNOWN_STATE';
+        return false;
+    }
+    $parts=explode(',',$sections[1]);
+    $markers=explode(',',$sections[2]);
+    if (count($markers)!==count($parts)) {
+        $error='INVALID_CHANGE_HEIGHTS';
+        return false;
+    }
+    $knownChanges=[];
+    foreach ($markers as $marker) {
+        if ($marker==='-') {
+            $knownChanges[]=null;
+            continue;
+        }
+        $changeHeight=0;
+        if (!parseUnsignedHeight($marker,$changeHeight) || $changeHeight>$knownHeight) {
+            $error='INVALID_CHANGE_HEIGHTS';
+            return false;
+        }
+        $knownChanges[]=$changeHeight;
+    }
+    return true;
+}
+function readPubsAddressState($address,$pubkeyhash,$index,array $record,&$outpoints,&$error) {
+    global $height,$TX_table,$TXO_table;
+
+    $addressBalance=0;
+    $utxos=[];
+    $lastChangeHeight=null;
+    if ($index!==false && isset($record[0]) && $record[0]===$pubkeyhash) {
+        $lastChangeHeight=(int)$record[1];
+        $txoIndex=(int)$record[2];
+        $visited=[];
+        while (true) {
+            if ($txoIndex<1 || $txoIndex>$TXO_table['bucket'][TOP] || isset($visited[$txoIndex])) {
+                $error='CORRUPT_TXO_INDEX';
+                return false;
+            }
+            $visited[$txoIndex]=true;
+            $txo=hashtable_read($TXO_table['bucket'],$txoIndex);
+            if (!isset($txo[3]) || $txo[3]!==$index || $txo[0]<1 || $txo[0]>$TX_table['bucket'][TOP]) {
+                $error='CORRUPT_TXO_INDEX';
+                return false;
+            }
+            $tx=hashtable_read($TX_table['bucket'],$txo[0]);
+            $outpoint=bin2hex($tx[0]).':'.(int)$txo[1];
+            if (isset($outpoints[$outpoint])) {
+                $error='DUPLICATE_OUTPOINT';
+                return false;
+            }
+            $outpoints[$outpoint]=true;
+            if ($txo[4]===0) {
+                $value=(int)$txo[2];
+                $blockHeight=(int)$tx[1];
+                $utxos[]=[
+                    'txid'=>bin2hex($tx[0]),
+                    'vout'=>(int)$txo[1],
+                    'value'=>$value,
+                    'height'=>$blockHeight,
+                    'confirmations'=>max(1,$height-$blockHeight),
+                    'scriptPubKey'=>'76a914'.bin2hex($pubkeyhash).'88ac'
+                ];
+                $addressBalance+=$value;
+            }
+            if ($txo[5]!==0) {
+                $txoIndex=(int)$txo[5];
+            } else {
+                break;
+            }
+        }
+    }
+    return [
+        'address'=>$address,
+        'lastChangeHeight'=>$lastChangeHeight,
+        'balance'=>$addressBalance,
+        'utxos'=>$utxos
+    ];
+}
+function handlePubsRequest($id,$params) {
+    global $height,$lastBlockHash,$PUB_table,$versionByte,$tikker;
+
+    if (!is_string($id) || $id==='' || strlen($id)>64) {
+        return pubsError($id,'INVALID_ID');
+    }
+
+    $parts=[];
+    $knownHeight=null;
+    $knownChanges=null;
+    $error='';
+    if (!parsePubsParameters($params,$parts,$knownHeight,$knownChanges,$error)) {
+        return pubsError($id,$error);
+    }
+    if (count($parts)<1 || count($parts)>MAX_PUBS) {
+        return pubsError($id,'INVALID_ADDRESS_COUNT');
+    }
+
+    $addresses=[];
+    $seen=[];
+    foreach ($parts as $part) {
+        $address=trim($part);
+        if ($address==='' || isset($seen[$address])) {
+            return pubsError($id,'INVALID_ADDRESS_SET');
+        }
+        $payload=base58check_decode($address);
+        if ($payload===false || strlen($payload)!==21 || ord($payload[0])!==$versionByte) {
+            return pubsError($id,'INVALID_COIN_ADDRESS');
+        }
+        $seen[$address]=true;
+        $addresses[]=[
+            'address'=>$address,
+            'pubkeyhash'=>substr($payload,1,20)
+        ];
+    }
+
+    $indexedHeight=max(0,$height-1);
+    $delta=is_array($knownChanges);
+    if ($delta && $indexedHeight<$knownHeight) {
+        return pubsError($id,'STATE_BEHIND');
+    }
+
+    $totalBalance=0;
+    $addressStates=[];
+    $outpoints=[];
+    foreach ($addresses as $position=>$item) {
+        $address=$item['address'];
+        $pubkeyhash=$item['pubkeyhash'];
+        list($index,$record)=find($PUB_table,$pubkeyhash);
+        $lastChangeHeight=($index!==false && isset($record[0]) && $record[0]===$pubkeyhash)?(int)$record[1]:null;
+        if ($delta && $knownChanges[$position]===$lastChangeHeight) {
+            continue;
+        }
+        $stateError='';
+        $addressState=readPubsAddressState($address,$pubkeyhash,$index,$record,$outpoints,$stateError);
+        if ($addressState===false) {return pubsError($id,$stateError);}
+        $addressStates[]=$addressState;
+        if (!$delta) {
+            $totalBalance+=$addressState['balance'];
+        }
+    }
+
+    $response=[
+        'ok'=>true,
+        'id'=>$id,
+        'coin'=>$tikker,
+        'mode'=>$delta?'delta':'full',
+        'height'=>$indexedHeight,
+        'blockHash'=>$lastBlockHash,
+        'addresses'=>$addressStates
+    ];
+    if (!$delta) {
+        $response['balance']=$totalBalance;
+    }
+    return encodePubsResponse($response);
+}
+function historyTimestampFromResult($result) {
+    if (!is_array($result) || !isset($result['time']) || !is_int($result['time']) || $result['time']<1) {
+        return false;
+    }
+    return $result['time'];
+}
+function historyBlockTimestamps(array $heights,&$error) {
+    global $RPC;
+
+    $timestamps=[];
+    foreach (array_chunk($heights,500) as $heightChunk) {
+        $calls=[];
+        foreach ($heightChunk as $blockHeight) {$calls[]=['getblockhash',[$blockHeight]];}
+        $hashResults=$RPC->batch($calls);
+        ksort($hashResults,SORT_NUMERIC);
+        $hashResults=array_values($hashResults);
+        if (count($hashResults)!==count($heightChunk)) {$error='HISTORY_TIME_UNAVAILABLE';return false;}
+        $headerCalls=[];
+        foreach ($hashResults as $hash) {
+            if ($hash instanceof \Exception || !is_string($hash) || !preg_match('/^[0-9a-fA-F]{64}$/',$hash)) {$error='HISTORY_TIME_UNAVAILABLE';return false;}
+            $headerCalls[]=['getblockheader',[$hash,true]];
+        }
+        $headerResults=$RPC->batch($headerCalls);
+        ksort($headerResults,SORT_NUMERIC);
+        $headerResults=array_values($headerResults);
+        $chunkTimestamps=[];
+        $fallbackOffsets=[];
+        if (count($headerResults)!==count($heightChunk)) {
+            foreach ($heightChunk as $offset=>$blockHeight) {$fallbackOffsets[]=$offset;}
+        } else {
+            foreach ($headerResults as $offset=>$header) {
+                $timestamp=historyTimestampFromResult($header);
+                if ($timestamp===false) {
+                    $fallbackOffsets[]=$offset;
+                } else {
+                    $chunkTimestamps[$offset]=$timestamp;
+                }
+            }
+        }
+        if (count($fallbackOffsets)>0) {
+            $blockCalls=[];
+            foreach ($fallbackOffsets as $offset) {$blockCalls[]=['getblock',[$hashResults[$offset]]];}
+            $blockResults=$RPC->batch($blockCalls);
+            ksort($blockResults,SORT_NUMERIC);
+            $blockResults=array_values($blockResults);
+            if (count($blockResults)!==count($fallbackOffsets)) {$error='HISTORY_TIME_UNAVAILABLE';return false;}
+            foreach ($blockResults as $position=>$block) {
+                $timestamp=historyTimestampFromResult($block);
+                if ($timestamp===false) {$error='HISTORY_TIME_UNAVAILABLE';return false;}
+                $chunkTimestamps[$fallbackOffsets[$position]]=$timestamp;
+            }
+        }
+        foreach ($heightChunk as $offset=>$blockHeight) {
+            if (!isset($chunkTimestamps[$offset])) {$error='HISTORY_TIME_UNAVAILABLE';return false;}
+            $timestamps[$blockHeight]=$chunkTimestamps[$offset];
+        }
+    }
+    return $timestamps;
+}
+function addHistoryEvent(&$events,$direction,$txid,$vout,$value,$address,$blockHeight) {
+    if (count($events)>=MAX_HISTORY_EVENTS) {return false;}
+    $events[]=[
+        'direction'=>$direction,
+        'txid'=>$txid,
+        'vout'=>$vout,
+        'value'=>$value,
+        'address'=>$address,
+        'height'=>$blockHeight
+    ];
+    return true;
+}
+function handleHistoryRequest($id,$params) {
+    global $height,$lastBlockHash,$TX_table,$TXO_table,$PUB_table,$versionByte,$tikker;
+
+    if (!is_string($id) || $id==='' || strlen($id)>64) {return pubsError($id,'INVALID_ID');}
+    $parts=explode(',',$params);
+    if (count($parts)<1 || count($parts)>MAX_PUBS) {return pubsError($id,'INVALID_ADDRESS_COUNT');}
+
+    $addresses=[];
+    $seen=[];
+    $walletPubIds=[];
+    foreach ($parts as $part) {
+        $address=trim($part);
+        if ($address==='' || isset($seen[$address])) {return pubsError($id,'INVALID_ADDRESS_SET');}
+        $payload=base58check_decode($address);
+        if ($payload===false || strlen($payload)!==21 || ord($payload[0])!==$versionByte) {return pubsError($id,'INVALID_COIN_ADDRESS');}
+        $pubkeyhash=substr($payload,1,20);
+        list($pubId,$record)=find($PUB_table,$pubkeyhash);
+        if ($pubId!==false && isset($record[0]) && $record[0]===$pubkeyhash) {$walletPubIds[$pubId]=true;}
+        $addresses[]=['address'=>$address,'pubId'=>$pubId,'record'=>$record,'pubkeyhash'=>$pubkeyhash];
+        $seen[$address]=true;
+    }
+
+    $walletOutputs=[];
+    $outgoingTransactions=[];
+    $visitedOutputs=[];
+    foreach ($addresses as $item) {
+        if ($item['pubId']===false || !isset($item['record'][0]) || $item['record'][0]!==$item['pubkeyhash']) {continue;}
+        $txoIndex=(int)$item['record'][2];
+        $addressVisited=[];
+        while (true) {
+            if ($txoIndex<1 || $txoIndex>$TXO_table['bucket'][TOP] || isset($addressVisited[$txoIndex]) || isset($visitedOutputs[$txoIndex])) {return pubsError($id,'CORRUPT_TXO_INDEX');}
+            $addressVisited[$txoIndex]=true;
+            $visitedOutputs[$txoIndex]=true;
+            $txo=hashtable_read($TXO_table['bucket'],$txoIndex);
+            if (!isset($txo[3]) || $txo[3]!==$item['pubId'] || $txo[0]<1 || $txo[0]>$TX_table['bucket'][TOP]) {return pubsError($id,'CORRUPT_TXO_INDEX');}
+            $tx=hashtable_read($TX_table['bucket'],$txo[0]);
+            if (!isset($tx[0]) || strlen($tx[0])!==32 || $tx[1]<1 || $tx[1]>$height-1) {return pubsError($id,'CORRUPT_TX_INDEX');}
+            if (count($walletOutputs)>=MAX_HISTORY_WALLET_OUTPUTS) {return pubsError($id,'HISTORY_TOO_LARGE');}
+            $walletOutputs[]=[
+                'txIndex'=>(int)$txo[0],
+                'txid'=>bin2hex($tx[0]),
+                'vout'=>(int)$txo[1],
+                'value'=>(int)$txo[2],
+                'address'=>$item['address'],
+                'height'=>(int)$tx[1]
+            ];
+            if ($txo[4]!==0) {
+                if ($txo[4]<1 || $txo[4]>$TX_table['bucket'][TOP]) {return pubsError($id,'CORRUPT_TX_INDEX');}
+                $outgoingTransactions[(int)$txo[4]]=true;
+                if (count($outgoingTransactions)>MAX_HISTORY_EVENTS) {return pubsError($id,'HISTORY_TOO_LARGE');}
+            }
+            if ($txo[5]===0) {break;}
+            $txoIndex=(int)$txo[5];
+        }
+    }
+
+    $events=[];
+    foreach ($walletOutputs as $output) {
+        if (isset($outgoingTransactions[$output['txIndex']])) {continue;}
+        if (!addHistoryEvent($events,'IN',$output['txid'],$output['vout'],$output['value'],$output['address'],$output['height'])) {return pubsError($id,'HISTORY_TOO_LARGE');}
+    }
+    foreach ($outgoingTransactions as $txIndex=>$unused) {
+        $tx=hashtable_read($TX_table['bucket'],$txIndex);
+        if (!isset($tx[0]) || strlen($tx[0])!==32 || $tx[1]<1 || $tx[1]>$height-1 || $tx[2]<1 || $tx[2]>$TXO_table['bucket'][TOP]) {return pubsError($id,'CORRUPT_TX_INDEX');}
+        $txid=bin2hex($tx[0]);
+        $txoIndex=(int)$tx[2];
+        $transactionVisited=[];
+        $transactionOutputCount=0;
+        while ($txoIndex<=$TXO_table['bucket'][TOP]) {
+            if (isset($transactionVisited[$txoIndex])) {return pubsError($id,'CORRUPT_TXO_INDEX');}
+            $transactionVisited[$txoIndex]=true;
+            $transactionOutputCount++;
+            if ($transactionOutputCount>MAX_HISTORY_EVENTS) {return pubsError($id,'HISTORY_TOO_LARGE');}
+            $txo=hashtable_read($TXO_table['bucket'],$txoIndex);
+            if ($txo[0]!==$txIndex) {break;}
+            if ($txo[3]<1 || $txo[3]>$PUB_table['bucket'][TOP]) {return pubsError($id,'CORRUPT_TXO_INDEX');}
+            if (!isset($walletPubIds[$txo[3]])) {
+                $pub=hashtable_read($PUB_table['bucket'],$txo[3]);
+                if (!isset($pub[0]) || strlen($pub[0])!==20) {return pubsError($id,'CORRUPT_TXO_INDEX');}
+                $address=address_from_pubkeyhash($pub[0]);
+                if (!addHistoryEvent($events,'OUT',$txid,(int)$txo[1],(int)$txo[2],$address,(int)$tx[1])) {return pubsError($id,'HISTORY_TOO_LARGE');}
+            }
+            $txoIndex++;
+        }
+    }
+
+    usort($events,function($left,$right){
+        if ($left['height']!==$right['height']) {return $left['height']<$right['height']?-1:1;}
+        $txCompare=strcmp($left['txid'],$right['txid']);
+        if ($txCompare!==0) {return $txCompare;}
+        if ($left['vout']!==$right['vout']) {return $left['vout']<$right['vout']?-1:1;}
+        return strcmp($left['direction'],$right['direction']);
+    });
+    $eventHeights=[];
+    foreach ($events as $event) {$eventHeights[$event['height']]=true;}
+    $timeError='';
+    $timestamps=historyBlockTimestamps(array_keys($eventHeights),$timeError);
+    if ($timestamps===false) {return pubsError($id,$timeError);}
+    foreach ($events as &$event) {
+        $event['timestamp']=$timestamps[$event['height']];
+    }
+    unset($event);
+
+    return encodePubsResponse([
+        'ok'=>true,
+        'id'=>$id,
+        'coin'=>$tikker,
+        'height'=>max(0,$height-1),
+        'blockHash'=>$lastBlockHash,
+        'events'=>$events
+    ]);
+}
 function handleClientRequest($request) {
     global $height,$TX_table,$TXO_table,$PUB_table,$versionByte;
     
@@ -845,6 +1707,8 @@ function handleClientRequest($request) {
         return "3!\n";
     }
     $a=$cmd[1];$b=$cmd[2];
+    $publicCommands=['stat','send','txstatus','zeroconf','history','pubs','pub','puball'];
+    if (!in_array($a,$publicCommands,true)) {return "?\n";}
     $output="";
     if ($a=="stat") {
         $txSpace=number_format(100-100*$TX_table['bucket'][TOP]*$TX_table['bucket'][RECORDSIZE]/$TX_table['bucket'][SIZE],1,".","");
@@ -977,6 +1841,16 @@ function handleClientRequest($request) {
             }
         }
         $output.= "(".(microtime(true)-$start).")\n\n";            
+    } elseif ($a=="send"){
+        return handleSendRequest($cmd[0],$b);
+    } elseif ($a=="txstatus"){
+        return handleTransactionStatusRequest($cmd[0],$b);
+    } elseif ($a=="zeroconf"){
+        return handleZeroConfirmationRequest($cmd[0],$b);
+    } elseif ($a=="history"){
+        return handleHistoryRequest($cmd[0],$b);
+    } elseif ($a=="pubs"){
+        return handlePubsRequest($cmd[0],$b);
     } elseif ($a=="pub"){
         $payload=base58check_decode($b);
         if ($payload) {
@@ -1758,6 +2632,55 @@ class JsonRpcClient {
         $this->last_error   = "";
         return $decoded['result'];
     }
+    public function callResult($method,$params=[]) {
+        $started=microtime(true);
+        $payload=json_encode([
+            'method'=>$method,
+            'params'=>$params,
+            'id'=>1
+        ]);
+        if ($payload===false) {
+            return ['technical'=>true,'ok'=>false,'error'=>'CORE_REQUEST_ENCODE_FAILED','durationMs'=>0];
+        }
+
+        $ch=curl_init($this->url);
+        curl_setopt_array($ch,[
+            CURLOPT_RETURNTRANSFER=>true,
+            CURLOPT_POST=>true,
+            CURLOPT_HTTPHEADER=>['Content-Type: application/json'],
+            CURLOPT_POSTFIELDS=>$payload,
+            CURLOPT_CONNECTTIMEOUT=>2,
+            CURLOPT_TIMEOUT=>6
+        ]);
+        $response=curl_exec($ch);
+        $httpCode=(int)curl_getinfo($ch,CURLINFO_HTTP_CODE);
+        if ($response===false) {
+            curl_close($ch);
+            return ['technical'=>true,'ok'=>false,'error'=>'CORE_RPC_UNAVAILABLE','durationMs'=>(int)round((microtime(true)-$started)*1000)];
+        }
+        curl_close($ch);
+
+        $decoded=json_decode($response,true);
+        $durationMs=(int)round((microtime(true)-$started)*1000);
+        if (!is_array($decoded) || (!array_key_exists('result',$decoded) && !array_key_exists('error',$decoded))) {
+            return ['technical'=>true,'ok'=>false,'error'=>'INVALID_CORE_RESPONSE','durationMs'=>$durationMs];
+        }
+        if ($httpCode!==0 && $httpCode!==200 && $httpCode!==500) {
+            return ['technical'=>true,'ok'=>false,'error'=>'CORE_HTTP_ERROR','durationMs'=>$durationMs];
+        }
+        if (isset($decoded['error']) && $decoded['error']!==null) {
+            $rpcCode=isset($decoded['error']['code'])?(int)$decoded['error']['code']:0;
+            $rpcMessage=isset($decoded['error']['message'])?(string)$decoded['error']['message']:'Core rejected the request';
+            if ($rpcCode===-28) {
+                return ['technical'=>true,'ok'=>false,'error'=>'CORE_NOT_READY','durationMs'=>$durationMs];
+            }
+            return ['technical'=>false,'ok'=>false,'rpcCode'=>$rpcCode,'rpcMessage'=>substr($rpcMessage,0,512),'durationMs'=>$durationMs];
+        }
+        if ($httpCode!==0 && $httpCode!==200) {
+            return ['technical'=>true,'ok'=>false,'error'=>'CORE_HTTP_ERROR','durationMs'=>$durationMs];
+        }
+        return ['technical'=>false,'ok'=>true,'result'=>$decoded['result'],'durationMs'=>$durationMs];
+    }
     private function handleError($msg) {
         if ($this->last_error !== $msg) {
             L("Caught exception: " . $msg);
@@ -1784,7 +2707,13 @@ class JsonRpcClient {
             $batch[] = $payload;
             $ids[$payload['id']] = $method;
         }
-        $responses = $this->sendRequest($batch);
+        try {
+            $responses=$this->sendRequest($batch);
+        } catch (\Exception $exception) {
+            $results=[];
+            foreach ($ids as $id=>$method) {$results[$id]=$exception;}
+            return $results;
+        }
         // Match responses by ID
         $results = [];
         foreach ($responses as $res) {
@@ -1813,11 +2742,15 @@ class JsonRpcClient {
             CURLOPT_POST => true,
             CURLOPT_POSTFIELDS => json_encode($payload),
             CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+            CURLOPT_CONNECTTIMEOUT => 2,
+            CURLOPT_TIMEOUT => 6,
         ]);
         $raw = curl_exec($ch);
         if ($raw === false) {
             $payloadTxt=print_r($payload,true);
-            throw new \Exception("CURL error \non {$this->url}\non $payloadTxt: " . curl_error($ch));
+            $curlError=curl_error($ch);
+            curl_close($ch);
+            throw new \Exception("CURL error \non {$this->url}\non $payloadTxt: ".$curlError);
         }
         curl_close($ch);
         $decoded = json_decode($raw, true);
@@ -1945,8 +2878,8 @@ function hashtable_add_TX(&$table,$record){
     The last link-pointer == 0 so apply (value-1) to obtain the index of the next record
       
     The (hash)index is accompanied by a $table structure to maintain the data:
-    $table['hash']   		// The (hash)index [memorypointer, size, top]; P=0,SIZE=1,TOP=2
-    $table['bucket'] 		// The bucket [memorypointer, size, top] 
+    $table['hash']          // The (hash)index [memorypointer, size, top]; P=0,SIZE=1,TOP=2
+    $table['bucket']        // The bucket [memorypointer, size, top] 
     $table['increment']         // To reduce memory reallocation; Increments size when top reaches size (except for $table['hash'])
     
     verify: SIZE is in bytes, but TOP is an index starting at 1, just like the pointers in the three tables; 
