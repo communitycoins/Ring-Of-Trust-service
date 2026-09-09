@@ -1,8 +1,14 @@
 <?php
-/* [CC-WALLET-006]
-ROT 0.8.5 bounded non-blocking socket transport and public-command hardening.
-Base: - Derived from MULTI-COIN-017 / ROT 0.8.4
+/* [CC-WALLET-007]
+ROT 0.8.6 authenticated proxy registration and in-process control manager.
+Base: - Derived from CC-WALLET-006 / ROT 0.8.5
 Changes:
+- [CC-WALLET-007] Create and retain one random rotid per ROT data directory
+- Add an optional sanitized nickname and deterministic fallback label
+- Discover proxy registration targets through the CommunityCoins bootstrap
+- Run registration and lease renewal asynchronously through existing cURL multi support
+- Authenticate private CCP1 status requests and return bounded chain checkpoints
+- Persist signed proxy messages and acknowledge them only after local storage
 - [CC-WALLET-006] Buffer partial requests and responses without blocking the single ROT loop
 - Bound client count, per-client lifetime, request/response size and total socket memory
 - Recalculate stream_select deadlines on every pass and enlarge the listen backlog
@@ -88,6 +94,9 @@ $environmentError='';
 $options = getopt('c:h', ['config:', 'help']);
 if (isset($options['h']) || isset($options['help'])) {die("Usage: php rot.php --config=/path/to/rot.conf\n");}
 $configFile = $options['c'] ?? $options['config'] ?? getenv('ROT_CONFIG') ?? null;
+$rotNicknameInput=getenv('ROT_NICKNAME');
+$proxySeedsInput=getenv('ROT_PROXY_SEEDS');
+$proxyTargetInput=getenv('ROT_PROXY_TARGET');
 if ($configFile) {
     $resolvedConfigFile=realpath($configFile);
     if ($resolvedConfigFile===false || !is_file($resolvedConfigFile)) {die("Error: config not found: $configFile\n");}
@@ -134,7 +143,7 @@ if ($corePath===$rotPath || strpos($rotPrefix,$corePrefix)===0 || strpos($corePr
 }
 $datadir=$corePath;
 $rotDataDir=$rotPath;
-define ("VERSION","0.8.5");
+define ("VERSION","0.8.6");
 define ("MAX_PUBS",51);
 define ("MAX_HISTORY_EVENTS",2000);
 define ("MAX_HISTORY_WALLET_OUTPUTS",4000);
@@ -147,6 +156,17 @@ define ("MAX_SOCKET_BUFFER_BYTES",33554432);
 define ("SOCKET_READ_TIMEOUT",5.0);
 define ("SOCKET_WRITE_TIMEOUT",10.0);
 define ("SOCKET_BACKLOG",256);
+define ("REGISTRATION_PROTOCOL",1);
+define ("REGISTRATION_INTERVAL",300);
+define ("REGISTRATION_JITTER",30);
+define ("REGISTRATION_CONNECT_TIMEOUT",2);
+define ("REGISTRATION_TOTAL_TIMEOUT",15);
+define ("REGISTRATION_RESPONSE_BYTES",65536);
+define ("REGISTRATION_TIMESTAMP_TOLERANCE",120);
+define ("REGISTRATION_DIRECTORY_LIFETIME",86400);
+define ("REGISTRATION_DIRECTORY_RETENTION",604800);
+define ("REGISTRATION_PUMP_INTERVAL",0.1);
+define ("REGISTRATION_DEFAULT_SEED","https://wallet.communitycoins.org/proxy.php");
 define("ROOT",$rotDataDir."/");
 define("Q",ROOT."Q");
 define("A",ROOT."A");
@@ -165,11 +185,20 @@ function now(){return date('d-m-Y H:i');}
 function L($what){$extra="";if (($what!=".")&&(substr($what,-1)!="\n")){$extra="\n";}file_put_contents(ROOT."rot.log",$what.$extra,FILE_APPEND);echo $what.$extra;}
 if (!function_exists('array_key_last')) {function array_key_last(array $array) {if (empty($array)) {return null;}return key(array_slice($array, -1, 1, true));}}
 
+$rotId=loadRotId();
+$rotNickname=sanitizeRotNickname($rotNicknameInput,$rotId);
+$registrationManager=initializeRegistrationManager($proxySeedsInput,$proxyTargetInput);
+
 $start=time();
 @unlink(DATA."TXidx");
 @unlink(DATA."BLKidx");
 file_put_contents(ROOT."pid",getmypid());
-register_shutdown_function(function(){@unlink(ROOT."pid");});
+register_shutdown_function(function(){
+    global $registrationManager;
+    if (isset($registrationManager['active']['handle'])) {@curl_multi_remove_handle($registrationManager['multi'],$registrationManager['active']['handle']);@curl_close($registrationManager['active']['handle']);}
+    if (isset($registrationManager['multi'])) {@curl_multi_close($registrationManager['multi']);}
+    @unlink(ROOT."pid");
+});
 
 $rpchost='127.0.0.1';
 if (strpos($rpcport,":")>0) {list($rpchost,$rpcport)=explode(":",$rpcport);}
@@ -475,6 +504,621 @@ foreach (extractBlocksFromStream() as $entry) {
 }
 // This will not be reached
 echo "If you are in doubt just confess...";
+
+function writeAtomicText($path,$content,$mode=0600) {
+    try {
+        $suffix=bin2hex(random_bytes(8));
+    } catch (\Exception $exception) {
+        return false;
+    }
+    $temporary=$path.'.tmp.'.getmypid().'.'.$suffix;
+    $handle=@fopen($temporary,'x');
+    if ($handle===false) {return false;}
+    $length=strlen($content);
+    $offset=0;
+    while ($offset<$length) {
+        $written=@fwrite($handle,substr($content,$offset));
+        if ($written===false || $written===0) {fclose($handle);@unlink($temporary);return false;}
+        $offset+=$written;
+    }
+    if (!fflush($handle)) {fclose($handle);@unlink($temporary);return false;}
+    fclose($handle);
+    @chmod($temporary,$mode);
+    if (!@rename($temporary,$path)) {@unlink($temporary);return false;}
+    return true;
+}
+
+function loadRotId() {
+    $path=ROOT.'rotid';
+    if (file_exists($path)) {
+        $value=trim((string)@file_get_contents($path));
+        if (!preg_match('/^[0-9a-f]{32}$/',$value)) {die("Invalid ROT identity file: $path\n");}
+        return $value;
+    }
+    try {
+        $value=bin2hex(random_bytes(16));
+    } catch (\Exception $exception) {
+        die("Cannot generate ROT identity\n");
+    }
+    $handle=@fopen($path,'x');
+    if ($handle===false) {
+        $existing=trim((string)@file_get_contents($path));
+        if (!preg_match('/^[0-9a-f]{32}$/',$existing)) {die("Cannot create ROT identity: $path\n");}
+        return $existing;
+    }
+    $content=$value."\n";
+    $written=@fwrite($handle,$content);
+    $flushed=$written===strlen($content) && fflush($handle);
+    fclose($handle);
+    @chmod($path,0600);
+    if (!$flushed) {die("Cannot store ROT identity: $path\n");}
+    return $value;
+}
+
+function sanitizeRotNickname($value,$rotId) {
+    $nickname=is_string($value)?preg_replace('/[^A-Za-z0-9._-]/','',$value):'';
+    $nickname=substr((string)$nickname,0,32);
+    return $nickname===''?substr($rotId,-6):$nickname;
+}
+
+function normalizedProxyUrl($value) {
+    if (!is_string($value) || strlen($value)>255) {return false;}
+    $parts=parse_url(trim($value));
+    if (!is_array($parts) || !isset($parts['scheme'],$parts['host']) || strtolower($parts['scheme'])!=='https' || isset($parts['user']) || isset($parts['pass']) || isset($parts['query']) || isset($parts['fragment'])) {return false;}
+    $host=strtolower($parts['host']);
+    if (!preg_match('/^(?=.{3,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/',$host)) {return false;}
+    $port=isset($parts['port'])?(int)$parts['port']:443;
+    if ($port!==443) {return false;}
+    $path=isset($parts['path'])?$parts['path']:'/proxy.php';
+    if ($path!=='/proxy.php') {return false;}
+    return 'https://'.$host.'/proxy.php';
+}
+
+function registrationSeeds($value) {
+    $source=is_string($value) && trim($value)!==''?$value:REGISTRATION_DEFAULT_SEED;
+    $result=[];
+    foreach (explode(',',$source) as $candidate) {
+        $url=normalizedProxyUrl($candidate);
+        if ($url!==false) {$result[$url]=$url;}
+        if (count($result)>=10) {break;}
+    }
+    if (count($result)===0) {die("No valid ROT proxy seed configured\n");}
+    return array_values($result);
+}
+
+function loadRegistrationState() {
+    $path=ROOT.'proxy-registrations.json';
+    if (!file_exists($path)) {return ['version'=>1,'directory'=>[],'directoryFetchedAt'=>0,'directoryExpiresAt'=>0,'proxies'=>[]];}
+    $raw=@file_get_contents($path);
+    $decoded=is_string($raw)?json_decode($raw,true):null;
+    if (!is_array($decoded) || !isset($decoded['version']) || $decoded['version']!==1) {
+        $preserved=$path.'.corrupt.'.time();
+        @rename($path,$preserved);
+        L("Invalid proxy registration state preserved as ".basename($preserved));
+        return ['version'=>1,'directory'=>[],'directoryFetchedAt'=>0,'directoryExpiresAt'=>0,'proxies'=>[]];
+    }
+    if (!isset($decoded['directory']) || !is_array($decoded['directory'])) {$decoded['directory']=[];}
+    if (!isset($decoded['proxies']) || !is_array($decoded['proxies'])) {$decoded['proxies']=[];}
+    $decoded['directoryFetchedAt']=isset($decoded['directoryFetchedAt'])?(int)$decoded['directoryFetchedAt']:0;
+    $decoded['directoryExpiresAt']=isset($decoded['directoryExpiresAt'])?(int)$decoded['directoryExpiresAt']:0;
+    return $decoded;
+}
+
+function saveRegistrationState() {
+    global $registrationManager;
+
+    $encoded=json_encode($registrationManager['state'],JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT);
+    if ($encoded===false || !writeAtomicText(ROOT.'proxy-registrations.json',$encoded."\n",0600)) {
+        L("Cannot persist proxy registration state");
+        return false;
+    }
+    return true;
+}
+
+function initializeRegistrationManager($seedInput,$targetInput) {
+    if (!function_exists('curl_multi_init')) {die("PHP cURL multi support required\n");}
+    $target=3;
+    if (is_string($targetInput) && $targetInput!=='') {
+        if (!preg_match('/^[1-9][0-9]*$/',$targetInput) || (int)$targetInput<1 || (int)$targetInput>10) {die("ROT_PROXY_TARGET must be 1 through 10\n");}
+        $target=(int)$targetInput;
+    }
+    $asynchronousDns=defined('CURL_VERSION_ASYNCHDNS') && (curl_version()['features'] & CURL_VERSION_ASYNCHDNS)!==0;
+    if (!$asynchronousDns) {L("Warning: libcurl does not advertise asynchronous DNS");}
+    return [
+        'multi'=>curl_multi_init(),
+        'active'=>null,
+        'buffers'=>[],
+        'seeds'=>registrationSeeds($seedInput),
+        'seedIndex'=>0,
+        'target'=>$target,
+        'state'=>loadRegistrationState(),
+        'directoryRetryAt'=>0,
+        'asynchronousDns'=>$asynchronousDns
+    ];
+}
+
+function registrationJitter($seconds=REGISTRATION_JITTER) {
+    try {
+        return random_int(-$seconds,$seconds);
+    } catch (\Exception $exception) {
+        return mt_rand(-$seconds,$seconds);
+    }
+}
+
+function validProxyId($value) {
+    return is_string($value) && preg_match('/^[A-Za-z0-9._-]{3,64}$/',$value)?$value:false;
+}
+
+function validateProxyDirectory($decoded) {
+    if (!is_array($decoded) || !isset($decoded['ok'],$decoded['protocol'],$decoded['generatedAt'],$decoded['expiresAt'],$decoded['proxies']) || $decoded['ok']!==true || $decoded['protocol']!==1 || !is_int($decoded['generatedAt']) || !is_int($decoded['expiresAt']) || !is_array($decoded['proxies']) || count($decoded['proxies'])<1 || count($decoded['proxies'])>10) {return false;}
+    if ($decoded['expiresAt']<time()-REGISTRATION_TIMESTAMP_TOLERANCE || abs(time()-$decoded['generatedAt'])>REGISTRATION_TIMESTAMP_TOLERANCE+300) {return false;}
+    $result=[];
+    foreach ($decoded['proxies'] as $entry) {
+        if (!is_array($entry) || !isset($entry['proxyId'],$entry['proxyUrl'],$entry['acceptsRegistrations'],$entry['acceptedCoins']) || $entry['acceptsRegistrations']!==true || !is_array($entry['acceptedCoins'])) {continue;}
+        $proxyId=validProxyId($entry['proxyId']);
+        $url=normalizedProxyUrl($entry['proxyUrl']);
+        if ($proxyId===false || $url===false) {continue;}
+        $coins=[];
+        foreach ($entry['acceptedCoins'] as $coin) {if (is_string($coin) && preg_match('/^[A-Z0-9]{2,10}$/',$coin)) {$coins[$coin]=$coin;}}
+        if (count($coins)===0) {continue;}
+        $result[$proxyId]=['proxyId'=>$proxyId,'proxyUrl'=>$url,'acceptedCoins'=>array_values($coins),'observedAt'=>isset($entry['observedAt'])?(int)$entry['observedAt']:0];
+    }
+    return count($result)>0?array_values($result):false;
+}
+
+function selectedProxyIds() {
+    global $registrationManager,$rotId,$tikker;
+
+    $ranked=[];
+    foreach ($registrationManager['state']['directory'] as $entry) {
+        if (!is_array($entry) || !isset($entry['proxyId'],$entry['proxyUrl'],$entry['acceptedCoins']) || !in_array($tikker,$entry['acceptedCoins'],true)) {continue;}
+        $ranked[]=['proxyId'=>$entry['proxyId'],'score'=>hash('sha256',$rotId.'|'.$entry['proxyId'])];
+    }
+    usort($ranked,function($left,$right) {return strcmp($left['score'],$right['score']);});
+    $selected=[];
+    foreach (array_slice($ranked,0,$registrationManager['target']) as $entry) {$selected[$entry['proxyId']]=true;}
+    return $selected;
+}
+
+function mergeRegistrationDirectory(array $directory,$generatedAt,$expiresAt) {
+    global $registrationManager;
+
+    $registrationManager['state']['directory']=$directory;
+    $registrationManager['state']['directoryFetchedAt']=$generatedAt;
+    $registrationManager['state']['directoryExpiresAt']=$expiresAt;
+    $selected=selectedProxyIds();
+    $present=[];
+    foreach ($directory as $entry) {
+        $proxyId=$entry['proxyId'];
+        $present[$proxyId]=true;
+        $previous=isset($registrationManager['state']['proxies'][$proxyId]) && is_array($registrationManager['state']['proxies'][$proxyId])?$registrationManager['state']['proxies'][$proxyId]:[];
+        $registrationManager['state']['proxies'][$proxyId]=array_merge($previous,[
+            'proxyId'=>$proxyId,
+            'proxyUrl'=>$entry['proxyUrl'],
+            'selected'=>isset($selected[$proxyId]),
+            'nextDueAt'=>isset($previous['nextDueAt'])?(int)$previous['nextDueAt']:time()
+        ]);
+    }
+    foreach (array_keys($registrationManager['state']['proxies']) as $proxyId) {
+        if (!isset($present[$proxyId])) {unset($registrationManager['state']['proxies'][$proxyId]);continue;}
+        $registrationManager['state']['proxies'][$proxyId]['selected']=isset($selected[$proxyId]);
+    }
+    saveRegistrationState();
+}
+
+function registrationWriteChunk($handle,$data) {
+    global $registrationManager;
+
+    $id=(int)$handle;
+    if (!isset($registrationManager['buffers'][$id])) {$registrationManager['buffers'][$id]='';}
+    if (strlen($registrationManager['buffers'][$id])+strlen($data)>REGISTRATION_RESPONSE_BYTES) {return 0;}
+    $registrationManager['buffers'][$id].=$data;
+    return strlen($data);
+}
+
+function startRegistrationTransfer($type,$url,array $payload,array $meta=[]) {
+    global $registrationManager;
+
+    if ($registrationManager['active']!==null) {return false;}
+    $json=json_encode($payload,JSON_UNESCAPED_SLASHES);
+    if ($json===false) {return false;}
+    $handle=curl_init($url);
+    if ($handle===false) {return false;}
+    curl_setopt_array($handle,[
+        CURLOPT_POST=>true,
+        CURLOPT_HTTPHEADER=>['Content-Type: application/json','Accept: application/json'],
+        CURLOPT_POSTFIELDS=>$json,
+        CURLOPT_RETURNTRANSFER=>false,
+        CURLOPT_WRITEFUNCTION=>'registrationWriteChunk',
+        CURLOPT_CONNECTTIMEOUT=>REGISTRATION_CONNECT_TIMEOUT,
+        CURLOPT_TIMEOUT=>REGISTRATION_TOTAL_TIMEOUT,
+        CURLOPT_SSL_VERIFYPEER=>true,
+        CURLOPT_SSL_VERIFYHOST=>2,
+        CURLOPT_FOLLOWLOCATION=>false,
+        CURLOPT_MAXREDIRS=>0,
+        CURLOPT_PROTOCOLS=>CURLPROTO_HTTPS,
+        CURLOPT_REDIR_PROTOCOLS=>CURLPROTO_HTTPS,
+        CURLOPT_NOSIGNAL=>true,
+        CURLOPT_USERAGENT=>'CC-ROT/'.VERSION
+    ]);
+    $id=(int)$handle;
+    $registrationManager['buffers'][$id]='';
+    $registrationManager['active']=array_merge($meta,['type'=>$type,'url'=>$url,'handle'=>$handle,'startedAt'=>microtime(true)]);
+    if (curl_multi_add_handle($registrationManager['multi'],$handle)!==CURLM_OK) {
+        unset($registrationManager['buffers'][$id]);
+        curl_close($handle);
+        $registrationManager['active']=null;
+        return false;
+    }
+    return true;
+}
+
+function registrationFailureDelay($failures) {
+    $failures=max(1,(int)$failures);
+    return min(3600,60*(2**min(6,$failures-1)))+registrationJitter();
+}
+
+function failRegistrationJob(array $meta,$reason) {
+    global $registrationManager;
+
+    $now=time();
+    if ($meta['type']==='directory') {
+        $failures=isset($registrationManager['state']['directoryFailures'])?(int)$registrationManager['state']['directoryFailures']+1:1;
+        $registrationManager['state']['directoryFailures']=$failures;
+        $registrationManager['directoryRetryAt']=$now+registrationFailureDelay($failures);
+        L("Proxy directory unavailable: $reason; retry later");
+        saveRegistrationState();
+        return;
+    }
+    if (!isset($meta['proxyId'],$registrationManager['state']['proxies'][$meta['proxyId']])) {return;}
+    $record=&$registrationManager['state']['proxies'][$meta['proxyId']];
+    $failures=isset($record['failures'])?(int)$record['failures']+1:1;
+    $record['failures']=$failures;
+    $record['lastError']=substr((string)$reason,0,96);
+    $record['nextDueAt']=$now+registrationFailureDelay($failures);
+    L("Proxy {$meta['proxyId']} registration unavailable: $reason");
+    saveRegistrationState();
+}
+
+function responseMessageDigest(array $messages) {
+    $json=json_encode(array_values($messages),JSON_UNESCAPED_SLASHES);
+    return hash('sha256',$json===false?'[]':$json);
+}
+
+function registrationResponseMac(array $record,array $body) {
+    global $rotId,$tikker;
+
+    if (!isset($record['authToken'],$record['proxyId']) || !isset($body['timestamp'],$body['status'],$body['expiresIn'],$body['retryAfter'],$body['messageSequence'],$body['messages'])) {return false;}
+    $ok=!empty($body['ok'])?'1':'0';
+    $error=isset($body['error'])?(string)$body['error']:'';
+    $nickname=isset($body['nickname'])?(string)$body['nickname']:'';
+    $latency=isset($body['statusLatencyMs']) && is_int($body['statusLatencyMs'])?(string)$body['statusLatencyMs']:'';
+    $serverTime=isset($body['serverTime']) && is_int($body['serverTime'])?(string)$body['serverTime']:'';
+    $message='CCP1|REGISTRATION-RES|'.$record['proxyId'].'|'.$rotId.'|'.$tikker.'|'.$body['timestamp'].'|'.$ok.'|'.$body['status'].'|'.$error.'|'.$nickname.'|'.$body['expiresIn'].'|'.$body['retryAfter'].'|'.$latency.'|'.$body['messageSequence'].'|'.responseMessageDigest($body['messages']).'|'.$serverTime;
+    return hash_hmac('sha256',$message,$record['authToken']);
+}
+
+function appendProxyMessages(array &$record,array $messages,$messageSequence) {
+    $ack=isset($record['ackSequence'])?(int)$record['ackSequence']:0;
+    $previous=$ack;
+    $lastSeen=$ack;
+    foreach ($messages as $message) {
+        if (!is_array($message) || !isset($message['sequence'],$message['time'],$message['code'],$message['text']) || !is_int($message['sequence']) || $message['sequence']<1 || $message['sequence']<=$lastSeen || !is_int($message['time']) || !is_string($message['code']) || !preg_match('/^[A-Z0-9_]{3,48}$/',$message['code']) || !is_string($message['text']) || strlen($message['text'])>256) {return false;}
+        if (isset($message['count']) && (!is_int($message['count']) || $message['count']<1)) {return false;}
+        if (isset($message['lastTime']) && !is_int($message['lastTime'])) {return false;}
+        $line=['time'=>gmdate('c',$message['time']),'proxyId'=>$record['proxyId'],'sequence'=>$message['sequence'],'code'=>$message['code'],'text'=>$message['text']];
+        if (isset($message['count'])) {$line['count']=$message['count'];}
+        if (isset($message['lastTime'])) {$line['lastTime']=$message['lastTime'];}
+        $encoded=json_encode($line,JSON_UNESCAPED_SLASHES);
+        if ($encoded===false || @file_put_contents(ROOT.'proxy-messages.log',$encoded."\n",FILE_APPEND|LOCK_EX)===false) {return false;}
+        $lastSeen=$message['sequence'];
+    }
+    if (!is_int($messageSequence) || $messageSequence<$previous || $messageSequence!==$lastSeen) {return false;}
+    $record['ackSequence']=$lastSeen;
+    return true;
+}
+
+function handleDirectoryResponse(array $meta,$httpCode,$raw) {
+    global $registrationManager;
+
+    if ($httpCode!==200) {failRegistrationJob($meta,'HTTP_'.$httpCode);return;}
+    $decoded=json_decode($raw,true);
+    $directory=validateProxyDirectory($decoded);
+    if ($directory===false) {failRegistrationJob($meta,'INVALID_DIRECTORY');return;}
+    $registrationManager['state']['directoryFailures']=0;
+    $registrationManager['directoryRetryAt']=0;
+    mergeRegistrationDirectory($directory,$decoded['generatedAt'],$decoded['expiresAt']);
+    L("Proxy directory updated: ".count($directory)." active");
+}
+
+function handleRegisterResponse(array $meta,$httpCode,$raw) {
+    global $registrationManager,$rotId,$rotNickname,$tikker;
+
+    if (!isset($meta['proxyId'],$registrationManager['state']['proxies'][$meta['proxyId']])) {return;}
+    $record=&$registrationManager['state']['proxies'][$meta['proxyId']];
+    $decoded=json_decode($raw,true);
+    if ($httpCode!==201 || !is_array($decoded) || !isset($decoded['ok'],$decoded['protocol'],$decoded['proxyId'],$decoded['rotId'],$decoded['nickname'],$decoded['coin'],$decoded['status'],$decoded['authToken'],$decoded['expiresIn'],$decoded['timestampTolerance']) || $decoded['ok']!==true || $decoded['protocol']!==1 || !hash_equals($record['proxyId'],$decoded['proxyId']) || !hash_equals($rotId,$decoded['rotId']) || !hash_equals($rotNickname,$decoded['nickname']) || $decoded['coin']!==$tikker || $decoded['status']!=='CANDIDATE' || !is_string($decoded['authToken']) || !preg_match('/^[0-9a-f]{64}$/',$decoded['authToken']) || !is_int($decoded['expiresIn']) || $decoded['expiresIn']<1 || !is_int($decoded['timestampTolerance']) || $decoded['timestampTolerance']<30 || $decoded['timestampTolerance']>600) {
+        failRegistrationJob($meta,'INVALID_REGISTER_RESPONSE');
+        return;
+    }
+    $record['authToken']=$decoded['authToken'];
+    $record['status']='CANDIDATE';
+    $record['expiresAt']=time()+$decoded['expiresIn'];
+    $record['timestampTolerance']=$decoded['timestampTolerance'];
+    $record['clockOffset']=0;
+    $record['ackSequence']=0;
+    $record['failures']=0;
+    $record['lastError']='';
+    $record['nextDueAt']=time()+1;
+    if (!saveRegistrationState()) {
+        $record['authToken']='';
+        $record['nextDueAt']=time()+300;
+        return;
+    }
+    L("Registered candidate at {$record['proxyId']}");
+}
+
+function validRegistrationMessages($messages) {
+    return is_array($messages) && count($messages)<=16;
+}
+
+function handleStatusResponse(array $meta,$httpCode,$raw) {
+    global $registrationManager,$rotId,$tikker;
+
+    if (!isset($meta['proxyId'],$registrationManager['state']['proxies'][$meta['proxyId']])) {return;}
+    $record=&$registrationManager['state']['proxies'][$meta['proxyId']];
+    $decoded=json_decode($raw,true);
+    if (($httpCode===401 || $httpCode===404 || $httpCode===409) && is_array($decoded) && isset($decoded['error']) && in_array($decoded['error'],['INVALID_REGISTRATION_AUTH','REGISTRATION_NOT_FOUND','REGISTRATION_CHANGED'],true)) {
+        $record['authToken']='';
+        $record['ackSequence']=0;
+        $record['nextDueAt']=time()+300;
+        saveRegistrationState();
+        return;
+    }
+    $signed=$httpCode===200 || $httpCode===409;
+    if (!$signed || !is_array($decoded) || !isset($decoded['ok'],$decoded['protocol'],$decoded['proxyId'],$decoded['rotId'],$decoded['coin'],$decoded['status'],$decoded['expiresIn'],$decoded['retryAfter'],$decoded['messageSequence'],$decoded['messages'],$decoded['timestamp'],$decoded['mac']) || $decoded['protocol']!==1 || !hash_equals($record['proxyId'],$decoded['proxyId']) || !hash_equals($rotId,$decoded['rotId']) || $decoded['coin']!==$tikker || !in_array($decoded['status'],['CANDIDATE','READY','LEADING','RECOVERING','QUARANTINED','ENDED'],true) || !validRegistrationMessages($decoded['messages']) || !is_int($decoded['expiresIn']) || $decoded['expiresIn']<0 || !is_int($decoded['retryAfter']) || $decoded['retryAfter']<0 || !is_int($decoded['messageSequence']) || $decoded['messageSequence']<0 || !is_int($decoded['timestamp']) || !is_string($decoded['mac'])) {
+        if ($httpCode===401 || $httpCode===404) {$record['authToken']='';$record['ackSequence']=0;$record['nextDueAt']=time()+300;saveRegistrationState();return;}
+        failRegistrationJob($meta,'INVALID_STATUS_RESPONSE');
+        return;
+    }
+    $expected=registrationResponseMac($record,$decoded);
+    if ($expected===false || !preg_match('/^[0-9a-f]{64}$/',$decoded['mac']) || !hash_equals($expected,$decoded['mac'])) {failRegistrationJob($meta,'INVALID_STATUS_MAC');return;}
+    $localNow=time();
+    if ($httpCode===409 && isset($decoded['error'],$decoded['serverTime']) && $decoded['error']==='CLOCK_SKEW' && is_int($decoded['serverTime'])) {
+        $record['clockOffset']=$decoded['serverTime']-$localNow;
+        $record['nextDueAt']=$localNow+60;
+        $record['failures']=0;
+        saveRegistrationState();
+        L("Adjusted proxy clock for {$record['proxyId']}");
+        return;
+    }
+    $expectedNow=$localNow+(isset($record['clockOffset'])?(int)$record['clockOffset']:0);
+    if (abs($expectedNow-$decoded['timestamp'])>(isset($record['timestampTolerance'])?(int)$record['timestampTolerance']:REGISTRATION_TIMESTAMP_TOLERANCE)) {failRegistrationJob($meta,'STATUS_CLOCK_INVALID');return;}
+    if ($httpCode!==200 || $decoded['ok']!==true) {failRegistrationJob($meta,'STATUS_REJECTED');return;}
+    $previousAck=isset($record['ackSequence'])?(int)$record['ackSequence']:0;
+    if (!appendProxyMessages($record,$decoded['messages'],$decoded['messageSequence'])) {failRegistrationJob($meta,'MESSAGE_STORAGE_FAILED');return;}
+    $record['status']=$decoded['status'];
+    $record['expiresAt']=$localNow+max(0,$decoded['expiresIn']);
+    $record['failures']=0;
+    $record['lastError']='';
+    $delay=$decoded['retryAfter']>0?$decoded['retryAfter']:REGISTRATION_INTERVAL+registrationJitter();
+    if ($decoded['status']==='ENDED') {$record['authToken']='';$delay=max(300,$delay);}
+    $record['nextDueAt']=$localNow+max(30,$delay);
+    if (!saveRegistrationState()) {
+        $record['ackSequence']=$previousAck;
+        $record['nextDueAt']=$localNow+300;
+        return;
+    }
+    L("Proxy {$record['proxyId']} status: {$record['status']}");
+}
+
+function finishRegistrationTransfer(array $meta,$curlResult,$httpCode,$raw) {
+    if ($curlResult!==CURLE_OK) {failRegistrationJob($meta,'CURL_'.$curlResult);return;}
+    if ($meta['type']==='directory') {handleDirectoryResponse($meta,$httpCode,$raw);return;}
+    if ($meta['type']==='register') {handleRegisterResponse($meta,$httpCode,$raw);return;}
+    if ($meta['type']==='status') {handleStatusResponse($meta,$httpCode,$raw);}
+}
+
+function pumpRegistrationManager() {
+    global $registrationManager;
+
+    if ($registrationManager['active']===null) {return;}
+    do {
+        $status=curl_multi_exec($registrationManager['multi'],$running);
+    } while ($status===CURLM_CALL_MULTI_PERFORM);
+    while (($info=curl_multi_info_read($registrationManager['multi']))!==false) {
+        if (!isset($info['handle']) || $registrationManager['active']===null || $info['handle']!==$registrationManager['active']['handle']) {continue;}
+        $handle=$info['handle'];
+        $id=(int)$handle;
+        $raw=isset($registrationManager['buffers'][$id])?$registrationManager['buffers'][$id]:'';
+        $httpCode=(int)curl_getinfo($handle,CURLINFO_HTTP_CODE);
+        $meta=$registrationManager['active'];
+        curl_multi_remove_handle($registrationManager['multi'],$handle);
+        curl_close($handle);
+        unset($registrationManager['buffers'][$id]);
+        $registrationManager['active']=null;
+        finishRegistrationTransfer($meta,isset($info['result'])?(int)$info['result']:CURLE_FAILED_INIT,$httpCode,$raw);
+    }
+}
+
+function startDirectoryRequest() {
+    global $registrationManager;
+
+    $seed=$registrationManager['seeds'][$registrationManager['seedIndex']%count($registrationManager['seeds'])];
+    $registrationManager['seedIndex']++;
+    return startRegistrationTransfer('directory',$seed,['operation'=>'proxyDirectory','protocol'=>1],[]);
+}
+
+function startProxyRegistration(array $record) {
+    global $rotId,$rotNickname,$tikker;
+
+    return startRegistrationTransfer('register',$record['proxyUrl'],[
+        'operation'=>'rotRegister',
+        'protocol'=>1,
+        'coin'=>$tikker,
+        'rotId'=>$rotId,
+        'nickname'=>$rotNickname,
+        'port'=>(int)SOCKET
+    ],['proxyId'=>$record['proxyId']]);
+}
+
+function startProxyStatus(array $record) {
+    global $rotId,$tikker;
+
+    $ack=isset($record['ackSequence'])?(int)$record['ackSequence']:0;
+    $timestamp=time()+(isset($record['clockOffset'])?(int)$record['clockOffset']:0);
+    $message='CCP1|REGISTRATION|'.$record['proxyId'].'|'.$rotId.'|'.$tikker.'|'.$timestamp.'|'.$ack;
+    return startRegistrationTransfer('status',$record['proxyUrl'],[
+        'operation'=>'rotRegistrationStatus',
+        'coin'=>$tikker,
+        'rotId'=>$rotId,
+        'timestamp'=>$timestamp,
+        'ackSequence'=>$ack,
+        'mac'=>hash_hmac('sha256',$message,$record['authToken'])
+    ],['proxyId'=>$record['proxyId']]);
+}
+
+function scheduleRegistrationWork() {
+    global $registrationManager;
+
+    if ($registrationManager['active']!==null) {return;}
+    $now=time();
+    $fetched=(int)$registrationManager['state']['directoryFetchedAt'];
+    $expired=(int)$registrationManager['state']['directoryExpiresAt'];
+    $directoryMissing=count($registrationManager['state']['directory'])===0;
+    $refreshDue=$fetched+REGISTRATION_DIRECTORY_LIFETIME<=$now;
+    if (($directoryMissing || $refreshDue) && $registrationManager['directoryRetryAt']<=$now) {
+        if (!startDirectoryRequest()) {$registrationManager['directoryRetryAt']=$now+60;}
+        return;
+    }
+    if ($expired+REGISTRATION_DIRECTORY_RETENTION<$now) {return;}
+    $selected=selectedProxyIds();
+    $due=[];
+    foreach ($registrationManager['state']['proxies'] as $proxyId=>$record) {
+        if (!isset($selected[$proxyId]) || !is_array($record) || !isset($record['proxyUrl'])) {continue;}
+        $next=isset($record['nextDueAt'])?(int)$record['nextDueAt']:0;
+        if ($next<=$now) {$due[$proxyId]=$next;}
+    }
+    if (count($due)===0) {return;}
+    asort($due,SORT_NUMERIC);
+    $proxyId=(string)key($due);
+    $record=$registrationManager['state']['proxies'][$proxyId];
+    $hasToken=isset($record['authToken']) && is_string($record['authToken']) && preg_match('/^[0-9a-f]{64}$/',$record['authToken']);
+    $started=$hasToken?startProxyStatus($record):startProxyRegistration($record);
+    if (!$started) {
+        $registrationManager['state']['proxies'][$proxyId]['nextDueAt']=$now+60;
+        saveRegistrationState();
+    }
+}
+
+function registrationTick() {
+    pumpRegistrationManager();
+    scheduleRegistrationWork();
+    pumpRegistrationManager();
+}
+
+function registrationTransferActive() {
+    global $registrationManager;
+    return $registrationManager['active']!==null;
+}
+
+function proxyRegistrationRecord($proxyId) {
+    global $registrationManager;
+
+    if (!isset($registrationManager['state']['proxies'][$proxyId]) || !is_array($registrationManager['state']['proxies'][$proxyId])) {return false;}
+    $record=$registrationManager['state']['proxies'][$proxyId];
+    return isset($record['authToken']) && is_string($record['authToken']) && preg_match('/^[0-9a-f]{64}$/',$record['authToken'])?$record:false;
+}
+
+function blockHashAtHeight($requestedHeight) {
+    if (!is_int($requestedHeight) || $requestedHeight<0) {return false;}
+    $handle=@fopen(DATA.'blockhashes','rb');
+    if ($handle===false) {return false;}
+    if (fseek($handle,$requestedHeight*65,SEEK_SET)!==0) {fclose($handle);return false;}
+    $hash=fread($handle,64);
+    fclose($handle);
+    return is_string($hash) && preg_match('/^[0-9a-f]{64}$/',$hash)?$hash:false;
+}
+
+function defaultCheckpointHeights($tip) {
+    $mature=max(1,$tip-100);
+    $latest=(int)floor($mature/10000)*10000;
+    if ($latest<1) {$latest=$mature;}
+    $heights=[];
+    for ($i=2;$i>=0;$i--) {
+        $candidate=$latest-$i*10000;
+        if ($candidate>=1) {$heights[$candidate]=$candidate;}
+    }
+    if (count($heights)===0 && $mature>=1) {$heights[$mature]=$mature;}
+    return array_values($heights);
+}
+
+function privateStatusResponse($requestId,$parameters) {
+    global $height,$lastBlockHash,$tikker,$raceToTheTop;
+
+    $parts=explode(',',$parameters);
+    $coin=array_shift($parts);
+    if ($coin!==$tikker || !preg_match('/^[0-9a-f]{32}$/',$requestId) || count($parts)>8) {return false;}
+    $tip=max(0,$height-1);
+    $requested=[];
+    foreach ($parts as $part) {
+        if (!preg_match('/^[1-9][0-9]*$/',$part)) {return false;}
+        $checkpoint=(int)$part;
+        if ($checkpoint>$tip) {return false;}
+        $requested[$checkpoint]=$checkpoint;
+    }
+    if (count($requested)===0) {foreach (defaultCheckpointHeights($tip) as $checkpoint) {$requested[$checkpoint]=$checkpoint;}}
+    ksort($requested,SORT_NUMERIC);
+    $checkpoints=[];
+    foreach ($requested as $checkpoint) {
+        $hash=blockHashAtHeight($checkpoint);
+        if ($hash===false) {return false;}
+        $checkpoints[(string)$checkpoint]=$hash;
+    }
+    if (count($checkpoints)<1 || count($checkpoints)>8 || !is_string($lastBlockHash) || !preg_match('/^[0-9a-f]{64}$/',$lastBlockHash)) {return false;}
+    return json_encode([
+        'ok'=>true,
+        'id'=>$requestId,
+        'coin'=>$tikker,
+        'ready'=>!$raceToTheTop,
+        'recovering'=>$raceToTheTop,
+        'height'=>$tip,
+        'blockHash'=>$lastBlockHash,
+        'checkpoints'=>$checkpoints
+    ],JSON_UNESCAPED_SLASHES);
+}
+
+function handlePrivateProxyRequest($request) {
+    global $rotId,$tikker;
+
+    $outer=explode('|',trim($request),6);
+    if (count($outer)!==6 || $outer[0]!=='CCP1') {return false;}
+    $proxyId=validProxyId($outer[1]);
+    if ($proxyId===false || !hash_equals($rotId,$outer[2]) || !preg_match('/^-?[0-9]+$/',$outer[3]) || !preg_match('/^[0-9a-f]{64}$/',$outer[4])) {return false;}
+    $record=proxyRegistrationRecord($proxyId);
+    if ($record===false) {return false;}
+    $timestamp=(int)$outer[3];
+    $expectedNow=time()+(isset($record['clockOffset'])?(int)$record['clockOffset']:0);
+    $tolerance=isset($record['timestampTolerance'])?(int)$record['timestampTolerance']:REGISTRATION_TIMESTAMP_TOLERANCE;
+    if (abs($expectedNow-$timestamp)>$tolerance) {return false;}
+    $expected=hash_hmac('sha256','CCP1|REQ|'.$proxyId.'|'.$rotId.'|'.$timestamp.'|'.$outer[5],$record['authToken']);
+    if (!hash_equals($expected,$outer[4])) {return false;}
+    $inner=explode('|',$outer[5],3);
+    if (count($inner)!==3 || $inner[1]!=='status') {return false;}
+    $body=privateStatusResponse($inner[0],$inner[2]);
+    if ($body===false) {return false;}
+    $responseTimestamp=$expectedNow;
+    $mac=hash_hmac('sha256','CCP1|RES|'.$proxyId.'|'.$rotId.'|'.$responseTimestamp.'|'.$body,$record['authToken']);
+    return 'CCP1|'.$proxyId.'|'.$rotId.'|'.$responseTimestamp.'|'.$mac.'|'.$body;
+}
+
+function handleSocketLine($request) {
+    if (strpos($request,'CCP1|')===0) {
+        $response=handlePrivateProxyRequest($request);
+        return $response===false?'?':$response;
+    }
+    return handleClientRequest($request);
+}
 
 function reverseHex(string $hex): string {
     return implode('', array_reverse(str_split($hex, 2)));
@@ -935,7 +1579,10 @@ function handleSocketRequests(float $deadline){
         stream_set_blocking($server,false);
     }
 
+    registrationTick();
+
     while (microtime(true)<$deadline) {
+        registrationTick();
         $now=microtime(true);
         $read=[$server];
         $write=[];
@@ -950,6 +1597,7 @@ function handleSocketRequests(float $deadline){
                 $waitUntil=min($waitUntil,$client['writeDeadline']);
             }
         }
+        if (registrationTransferActive()) {$waitUntil=min($waitUntil,$now+REGISTRATION_PUMP_INTERVAL);}
         $remaining=max(0.0,$waitUntil-$now);
         $timeoutSec=(int)floor($remaining);
         $timeoutUsec=(int)floor(($remaining-$timeoutSec)*1000000);
@@ -961,6 +1609,7 @@ function handleSocketRequests(float $deadline){
             L("stream_select failed: ".$message);
             break;
         }
+        registrationTick();
 
         foreach ($read as $sock) {
             if ($sock===$server) {
@@ -1008,7 +1657,7 @@ function handleSocketRequests(float $deadline){
                 continue;
             }
             if (DEBUG) {echo $line."\n";}
-            $response=handleClientRequest($line)."\n";
+            $response=handleSocketLine($line)."\n";
             $bufferedBytes-=strlen($clients[$id]['input']);
             $clients[$id]['input']='';
             if (strlen($response)>MAX_SOCKET_RESPONSE_BYTES || $bufferedBytes+strlen($response)>MAX_SOCKET_BUFFER_BYTES) {
