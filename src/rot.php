@@ -1,8 +1,10 @@
 <?php
-/* [CC-WALLET-007]
-ROT 0.8.6 authenticated proxy registration and in-process control manager.
-Base: - Derived from CC-WALLET-006 / ROT 0.8.5
+/* [CC-WALLET-008]
+ROT 0.8.7 authenticated registered wallet routing and quiet status logging.
+Base: - Derived from CC-WALLET-007 / ROT 0.8.6
 Changes:
+- [CC-WALLET-008] Route authenticated CCP1 wallet commands through the existing public allowlist
+- Log proxy status only on actual transitions and identify both old and new state
 - [CC-WALLET-007] Create and retain one random rotid per ROT data directory
 - Add an optional sanitized nickname and deterministic fallback label
 - Discover proxy registration targets through the CommunityCoins bootstrap
@@ -143,7 +145,7 @@ if ($corePath===$rotPath || strpos($rotPrefix,$corePrefix)===0 || strpos($corePr
 }
 $datadir=$corePath;
 $rotDataDir=$rotPath;
-define ("VERSION","0.8.6");
+define ("VERSION","0.8.7");
 define ("MAX_PUBS",51);
 define ("MAX_HISTORY_EVENTS",2000);
 define ("MAX_HISTORY_WALLET_OUTPUTS",4000);
@@ -896,6 +898,7 @@ function handleStatusResponse(array $meta,$httpCode,$raw) {
     if (abs($expectedNow-$decoded['timestamp'])>(isset($record['timestampTolerance'])?(int)$record['timestampTolerance']:REGISTRATION_TIMESTAMP_TOLERANCE)) {failRegistrationJob($meta,'STATUS_CLOCK_INVALID');return;}
     if ($httpCode!==200 || $decoded['ok']!==true) {failRegistrationJob($meta,'STATUS_REJECTED');return;}
     $previousAck=isset($record['ackSequence'])?(int)$record['ackSequence']:0;
+    $previousStatus=isset($record['status'])?$record['status']:'CANDIDATE';
     if (!appendProxyMessages($record,$decoded['messages'],$decoded['messageSequence'])) {failRegistrationJob($meta,'MESSAGE_STORAGE_FAILED');return;}
     $record['status']=$decoded['status'];
     $record['expiresAt']=$localNow+max(0,$decoded['expiresIn']);
@@ -909,7 +912,9 @@ function handleStatusResponse(array $meta,$httpCode,$raw) {
         $record['nextDueAt']=$localNow+300;
         return;
     }
-    L("Proxy {$record['proxyId']} status: {$record['status']}");
+    if ($previousStatus!==$record['status']) {
+        L("Proxy {$record['proxyId']} status: {$previousStatus} -> {$record['status']}");
+    }
 }
 
 function finishRegistrationTransfer(array $meta,$curlResult,$httpCode,$raw) {
@@ -1104,9 +1109,13 @@ function handlePrivateProxyRequest($request) {
     $expected=hash_hmac('sha256','CCP1|REQ|'.$proxyId.'|'.$rotId.'|'.$timestamp.'|'.$outer[5],$record['authToken']);
     if (!hash_equals($expected,$outer[4])) {return false;}
     $inner=explode('|',$outer[5],3);
-    if (count($inner)!==3 || $inner[1]!=='status') {return false;}
-    $body=privateStatusResponse($inner[0],$inner[2]);
-    if ($body===false) {return false;}
+    if (count($inner)!==3) {return false;}
+    if ($inner[1]==='status') {
+        $body=privateStatusResponse($inner[0],$inner[2]);
+    } else {
+        $body=handleClientRequest($outer[5]);
+    }
+    if (!is_string($body)) {return false;}
     $responseTimestamp=$expectedNow;
     $mac=hash_hmac('sha256','CCP1|RES|'.$proxyId.'|'.$rotId.'|'.$responseTimestamp.'|'.$body,$record['authToken']);
     return 'CCP1|'.$proxyId.'|'.$rotId.'|'.$responseTimestamp.'|'.$mac.'|'.$body;
