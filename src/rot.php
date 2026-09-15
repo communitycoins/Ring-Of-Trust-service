@@ -1,8 +1,9 @@
 <?php
-/* [CC-WALLET-012]
-ROT 0.8.8 all-proxy registration, retained coverage metrics and protected operator status.
-Base: - Derived from CC-WALLET-011 / ROT 0.8.7
+/* [CC-WALLET-013]
+ROT 0.8.9 startup visibility correction for protected operator status.
+Base: - Derived from CC-WALLET-012 / ROT 0.8.8
 Changes:
+- [CC-WALLET-013] Log invalid or exposed operator-secret failures through the normal ROT log before exit
 - [CC-WALLET-012] Register with every eligible advertised proxy by default, capped at ten
 - Retain bootstrap registered-ROT counts and signed proxy-reported status latency
 - Require the private per-ROT operator-secret for legacy stat and close silently on failure
@@ -148,7 +149,7 @@ if ($corePath===$rotPath || strpos($rotPrefix,$corePrefix)===0 || strpos($corePr
 }
 $datadir=$corePath;
 $rotDataDir=$rotPath;
-define ("VERSION","0.8.8");
+define ("VERSION","0.8.9");
 define ("MAX_PUBS",51);
 define ("MAX_HISTORY_EVENTS",2000);
 define ("MAX_HISTORY_WALLET_OUTPUTS",4000);
@@ -565,9 +566,9 @@ function loadOperatorSecret() {
     $path=ROOT.'operator-secret';
     if (!is_file($path)) {return false;}
     $permissions=@fileperms($path);
-    if ($permissions!==false && ($permissions&0077)!==0) {die("operator-secret must not be accessible by group or world\n");}
+    if ($permissions!==false && ($permissions&0077)!==0) {L("operator-secret must not be accessible by group or world");die();}
     $value=trim((string)@file_get_contents($path));
-    if (!preg_match('/^[0-9a-f]{64}$/',$value)) {die("Invalid operator-secret\n");}
+    if (!preg_match('/^[0-9a-f]{64}$/',$value)) {L("Invalid or unreadable operator-secret");die();}
     return $value;
 }
 
