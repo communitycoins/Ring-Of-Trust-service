@@ -1,10 +1,11 @@
 <?php
-/* [CC-WALLET-V2-003]
-ROT 0.8.10 PAK transaction and raw-block compatibility patch.
-Base: - Derived from Ring-Of-Trust-service main commit 9d0d47f4a7ee56b4f3b2a44b93737c7ee93c639a
+/* [CC-WALLET-V2-004]
+ROT 0.8.11 Pakcoin decoded-RPC-block compatibility correction.
+Base: - Derived from CC-WALLET-V2-003 / ROT 0.8.10
 Changes:
+- [CC-WALLET-V2-004] Treat Pakcoin getblock responses as decoded JSON and use the boolean txinfo argument
 - [CC-WALLET-V2-003] Define RPC block representation and transaction-layout differences as coin properties
-- Retrieve PAK RPC blocks with numeric verbosity 0 and retain the existing false argument for other coins
+- Retain boolean false as the getblock txinfo argument for all supported coins
 - Parse the four-byte transaction time used by PAK and DEM without coin-specific parser branches
 - Reject truncated varints and length-prefixed fields before ord(), unpack() or offset advancement
 - Report the actual stream offset and filename in block-read exceptions
@@ -155,7 +156,7 @@ if ($corePath===$rotPath || strpos($rotPrefix,$corePrefix)===0 || strpos($corePr
 }
 $datadir=$corePath;
 $rotDataDir=$rotPath;
-define ("VERSION","0.8.10");
+define ("VERSION","0.8.11");
 define ("MAX_PUBS",51);
 define ("MAX_HISTORY_EVENTS",2000);
 define ("MAX_HISTORY_WALLET_OUTPUTS",4000);
@@ -202,7 +203,7 @@ $coinSpecifications = [
     'DEM'=>['versionByte'=>53,'unitsPerCoin'=>1000000,'rpcBlockRepresentation'=>'decoded','transactionTimeBytes'=>4,'transactionComment'=>true],
     'EFL'=>['versionByte'=>48,'unitsPerCoin'=>100000000],
     'AUR'=>['versionByte'=>23,'unitsPerCoin'=>100000000],
-    'PAK'=>['versionByte'=>0x00,'unitsPerCoin'=>100000000,'rpcBlockVerbosity'=>0,'transactionTimeBytes'=>4],
+    'PAK'=>['versionByte'=>0x00,'unitsPerCoin'=>100000000,'rpcBlockRepresentation'=>'decoded','transactionTimeBytes'=>4],
     'SLG'=>['versionByte'=>0x00,'unitsPerCoin'=>100000000],
     'RUBTC'=>['versionByte'=>0x00,'unitsPerCoin'=>100000000],
     'FJC'=>['versionByte'=>0x00,'unitsPerCoin'=>100000000],
