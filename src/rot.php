@@ -1,8 +1,9 @@
 <?php
-/* [CC-WALLET-V2-004]
-ROT 0.8.11 Pakcoin decoded-RPC-block compatibility correction.
-Base: - Derived from CC-WALLET-V2-003 / ROT 0.8.10
+/* [CC-ROT_0_8-12]
+ROT 0.8.12 Pakcoin legacy-address version correction.
+Base: - Derived from CC-WALLET-V2-004 / ROT 0.8.11
 Changes:
+- [CC-ROT_0_8-12] Correct the PAK P2PKH version byte from 0x00 to 0x37
 - [CC-WALLET-V2-004] Treat Pakcoin getblock responses as decoded JSON and use the boolean txinfo argument
 - [CC-WALLET-V2-003] Define RPC block representation and transaction-layout differences as coin properties
 - Retain boolean false as the getblock txinfo argument for all supported coins
@@ -156,7 +157,7 @@ if ($corePath===$rotPath || strpos($rotPrefix,$corePrefix)===0 || strpos($corePr
 }
 $datadir=$corePath;
 $rotDataDir=$rotPath;
-define ("VERSION","0.8.11");
+define ("VERSION","0.8.12");
 define ("MAX_PUBS",51);
 define ("MAX_HISTORY_EVENTS",2000);
 define ("MAX_HISTORY_WALLET_OUTPUTS",4000);
@@ -203,7 +204,7 @@ $coinSpecifications = [
     'DEM'=>['versionByte'=>53,'unitsPerCoin'=>1000000,'rpcBlockRepresentation'=>'decoded','transactionTimeBytes'=>4,'transactionComment'=>true],
     'EFL'=>['versionByte'=>48,'unitsPerCoin'=>100000000],
     'AUR'=>['versionByte'=>23,'unitsPerCoin'=>100000000],
-    'PAK'=>['versionByte'=>0x00,'unitsPerCoin'=>100000000,'rpcBlockRepresentation'=>'decoded','transactionTimeBytes'=>4],
+    'PAK'=>['versionByte'=>0x37,'unitsPerCoin'=>100000000,'rpcBlockRepresentation'=>'decoded','transactionTimeBytes'=>4],
     'SLG'=>['versionByte'=>0x00,'unitsPerCoin'=>100000000],
     'RUBTC'=>['versionByte'=>0x00,'unitsPerCoin'=>100000000],
     'FJC'=>['versionByte'=>0x00,'unitsPerCoin'=>100000000],
