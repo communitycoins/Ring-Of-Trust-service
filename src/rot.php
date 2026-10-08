@@ -1,8 +1,15 @@
 <?php
-/* [CC-ROT_0_8-12]
-ROT 0.8.12 Pakcoin legacy-address version correction.
-Base: - Derived from CC-WALLET-V2-004 / ROT 0.8.11
+/* [CC-ROT_0_8-13]
+ROT 0.8.13 recoverable decoded-block transaction RPC handling.
+Base: - Derived from CC-ROT_0_8-12 / ROT 0.8.12
 Changes:
+- [CC-ROT_0_8-13] Retry technical getrawtransaction failures during decoded-block indexing
+- Treat RPC -5 as temporary transaction-index lag only when indexing a decoded block
+- Preserve the two-second block RPC timeout and cap total recovery at thirty seconds
+- Log timeout source, method and bounded retry/recovery details in rot.log
+- Mirror RPC failure, retry and recovery events to timestamped rpc.log
+- Keep proxy-registration leases responsive while Core RPC recovery is pending
+- Distinguish a temporary Core transport failure from rejection or malformed transaction data
 - [CC-ROT_0_8-12] Correct the PAK P2PKH version byte from 0x00 to 0x37
 - [CC-WALLET-V2-004] Treat Pakcoin getblock responses as decoded JSON and use the boolean txinfo argument
 - [CC-WALLET-V2-003] Define RPC block representation and transaction-layout differences as coin properties
@@ -157,7 +164,9 @@ if ($corePath===$rotPath || strpos($rotPrefix,$corePrefix)===0 || strpos($corePr
 }
 $datadir=$corePath;
 $rotDataDir=$rotPath;
-define ("VERSION","0.8.12");
+define ("VERSION","0.8.13");
+define ("BLOCK_RPC_TIMEOUT",2);
+define ("BLOCK_RPC_RECOVERY_LIMIT",30);
 define ("MAX_PUBS",51);
 define ("MAX_HISTORY_EVENTS",2000);
 define ("MAX_HISTORY_WALLET_OUTPUTS",4000);
@@ -213,6 +222,7 @@ $coinSpecifications = [
 ];
 function now(){return date('d-m-Y H:i');}
 function L($what){$extra="";if (($what!=".")&&(substr($what,-1)!="\n")){$extra="\n";}file_put_contents(ROOT."rot.log",$what.$extra,FILE_APPEND);echo $what.$extra;}
+function rpcLog($what){$line=preg_replace('/[\r\n]+/',' ',(string)$what);file_put_contents(ROOT."rpc.log",gmdate('Y-m-d\TH:i:s\Z')." ".$line."\n",FILE_APPEND);L($what);}
 if (!function_exists('array_key_last')) {function array_key_last(array $array) {if (empty($array)) {return null;}return key(array_slice($array, -1, 1, true));}}
 
 $rotId=loadRotId();
@@ -1893,7 +1903,7 @@ function handleSendRequest($id,$rawHex) {
         return sendResponse($id,false,'REJECTED',null,['error'=>'INVALID_RAW_TRANSACTION','rotMs'=>(int)round((microtime(true)-$started)*1000)]);
     }
 
-    $core=$RPC->callResult('sendrawtransaction',[$rawHex]);
+    $core=$RPC->callResult('sendrawtransaction',[$rawHex],'wallet-broadcast');
     $timing=['coreMs'=>$core['durationMs'],'rotMs'=>(int)round((microtime(true)-$started)*1000)];
     if ($core['technical']) {
         return sendResponse($id,false,'UNAVAILABLE',$localTxid,array_merge($timing,['technical'=>true,'error'=>$core['error']]));
@@ -1939,7 +1949,7 @@ function handleTransactionStatusRequest($id,$txid) {
         ]);
     }
 
-    $core=$RPC->callResult('getrawmempool',[]);
+    $core=$RPC->callResult('getrawmempool',[],'wallet-status');
     $timing=['coreMs'=>$core['durationMs'],'rotMs'=>(int)round((microtime(true)-$started)*1000)];
     if ($core['technical'] || !$core['ok'] || !is_array($core['result'])) {
         return sendResponse($id,false,'UNAVAILABLE',$txid,array_merge($timing,['technical'=>true,'error'=>'CORE_STATUS_UNAVAILABLE']));
@@ -2049,7 +2059,7 @@ function handleZeroConfirmationRequest($id,$parameters) {
         ]);
     }
 
-    $mempool=$RPC->callResult('getrawmempool',[]);
+    $mempool=$RPC->callResult('getrawmempool',[],'wallet-zero-confirmation');
     if ($mempool['technical'] || !$mempool['ok'] || !is_array($mempool['result'])) {
         return sendResponse($id,false,'UNAVAILABLE',$txid,['technical'=>true,'address'=>$address,'amountSats'=>$amountSats,'error'=>'CORE_MEMPOOL_UNAVAILABLE','coreMs'=>$mempool['durationMs'],'rotMs'=>(int)round((microtime(true)-$started)*1000)]);
     }
@@ -2057,7 +2067,7 @@ function handleZeroConfirmationRequest($id,$parameters) {
         return sendResponse($id,true,'NOT_SEEN',$txid,['address'=>$address,'amountSats'=>$amountSats,'confirmed'=>false,'coreMs'=>$mempool['durationMs'],'rotMs'=>(int)round((microtime(true)-$started)*1000)]);
     }
 
-    $decoded=$RPC->callResult('getrawtransaction',[$txid,1]);
+    $decoded=$RPC->callResult('getrawtransaction',[$txid,1],'wallet-zero-confirmation');
     $coreMs=$mempool['durationMs']+$decoded['durationMs'];
     if ($decoded['technical'] || !$decoded['ok'] || !is_array($decoded['result']) || !isset($decoded['result']['txid']) || strtolower((string)$decoded['result']['txid'])!==$txid || !isset($decoded['result']['vout']) || !is_array($decoded['result']['vout'])) {
         return sendResponse($id,false,'UNAVAILABLE',$txid,['technical'=>true,'address'=>$address,'amountSats'=>$amountSats,'error'=>'CORE_TRANSACTION_UNAVAILABLE','coreMs'=>$coreMs,'rotMs'=>(int)round((microtime(true)-$started)*1000)]);
@@ -2843,6 +2853,65 @@ class BlockIndex { /* loads all blockhashes through RPC;
 }
 
 class BlockParser { /* Unravels a binary block */
+    private function waitForRpcRetry($seconds): void {
+        $deadline=microtime(true)+max(1,(int)$seconds);
+        do {
+            registrationTick();
+            usleep(100000);
+        } while (microtime(true)<$deadline);
+        registrationTick();
+    }
+    private function fetchDecodedTransaction($txid): string {
+        global $height,$RPC,$tikker;
+
+        $failures=0;
+        $recoveryStarted=microtime(true);
+        while (true) {
+            $response=$RPC->callResult('getrawtransaction',[$txid,0],'block-index',false,BLOCK_RPC_TIMEOUT);
+            if (!$response['technical'] && !$response['ok']) {
+                $rpcCode=isset($response['rpcCode'])?(int)$response['rpcCode']:0;
+                $rpcMessage=isset($response['rpcMessage'])?preg_replace('/[\r\n]+/',' ',(string)$response['rpcMessage']):'Core rejected the transaction request';
+                if ($rpcCode!==-5) {
+                    throw new \UnexpectedValueException("Core rejected raw transaction at height $height, txid $txid, RPC $rpcCode: $rpcMessage");
+                }
+                $response['technical']=true;
+                $response['error']='CORE_TRANSACTION_NOT_INDEXED';
+                $response['detail']=$rpcMessage;
+            }
+            if (!$response['technical']) {
+                $txHex=isset($response['result'])?$response['result']:null;
+                if (!is_string($txHex) || strlen($txHex)<2 || (strlen($txHex)%2)!==0 || !ctype_xdigit($txHex)) {
+                    throw new \UnexpectedValueException("Invalid raw transaction at height $height, txid $txid");
+                }
+                if ($failures>0) {
+                    $elapsedMs=(int)round((microtime(true)-$recoveryStarted)*1000);
+                    rpcLog("Core RPC recovered: source=block-index coin=$tikker method=getrawtransaction height=$height txid=$txid failures=$failures elapsedMs=$elapsedMs durationMs={$response['durationMs']}");
+                }
+                return $txHex;
+            }
+
+            $failures++;
+            $error=isset($response['error'])?(string)$response['error']:'CORE_RPC_UNAVAILABLE';
+            if (!in_array($error,['CORE_RPC_TIMEOUT','CORE_RPC_UNAVAILABLE','CORE_NOT_READY','CORE_HTTP_ERROR','CORE_TRANSACTION_NOT_INDEXED'],true)) {
+                throw new \UnexpectedValueException("Technical Core RPC failure at height $height, txid $txid: $error");
+            }
+            $curlCode=isset($response['curlCode'])?(int)$response['curlCode']:0;
+            $rpcCode=isset($response['rpcCode'])?(int)$response['rpcCode']:0;
+            $durationMs=isset($response['durationMs'])?(int)$response['durationMs']:0;
+            $detail=isset($response['detail'])?preg_replace('/[\r\n]+/',' ',(string)$response['detail']):'';
+            if ($failures<=3 || ($failures%10)===0) {
+                rpcLog("Core RPC retry: source=block-index coin=$tikker method=getrawtransaction height=$height txid=$txid failure=$failures error=$error rpcCode=$rpcCode curlCode=$curlCode durationMs=$durationMs detail=$detail");
+            }
+            $elapsedMs=(int)round((microtime(true)-$recoveryStarted)*1000);
+            $remaining=(int)floor(BLOCK_RPC_RECOVERY_LIMIT-(microtime(true)-$recoveryStarted));
+            $wait=min(5,$failures,max(0,$remaining-BLOCK_RPC_TIMEOUT));
+            if ($wait<1) {
+                rpcLog("Core RPC recovery exhausted: source=block-index coin=$tikker method=getrawtransaction height=$height txid=$txid failures=$failures elapsedMs=$elapsedMs lastError=$error rpcCode=$rpcCode curlCode=$curlCode detail=$detail");
+                throw new \UnexpectedValueException("Core RPC recovery exhausted at height $height, txid $txid after $elapsedMs ms");
+            }
+            $this->waitForRpcRetry($wait);
+        }
+    }
     public function getBlock($buffer): array {
         global $height,$RPC;
         $skipped=0;
@@ -2851,10 +2920,11 @@ class BlockParser { /* Unravels a binary block */
             $txCount=count($buffer['tx']);
             for ($i = 0; $i < $txCount; $i++) {
                 $txid=$buffer['tx'][$i];
-                $txHex=$RPC->call('getrawtransaction', [$txid, 0]);
-                if (!is_string($txHex) || strlen($txHex)<2 || (strlen($txHex)%2)!==0 || !ctype_xdigit($txHex)) {throw new \UnexpectedValueException("Invalid raw transaction at height $height");}
+                if (!is_string($txid) || !preg_match('/^[0-9a-fA-F]{64}$/',$txid)) {throw new \UnexpectedValueException("Invalid transaction id at height $height");}
+                $txid=strtolower($txid);
+                $txHex=$this->fetchDecodedTransaction($txid);
                 $txBin=hex2bin($txHex);
-                if ($txBin===false) {throw new \UnexpectedValueException("Invalid raw transaction at height $height");}
+                if ($txBin===false) {throw new \UnexpectedValueException("Invalid raw transaction at height $height, txid $txid");}
                 $offset=0;
                 $tx = $this->parseTransactionLite($txBin, $offset);
                 if ($tx['is_relevant']) {$transactions[] = $tx;} else {$skipped++;}
@@ -3377,6 +3447,7 @@ class JsonRpcClient {
         $this->url = "http://{$rpc['user']}:{$rpc['pass']}@{$rpc['host']}:{$rpc['port']}/";
     }
     public function call($method, $params = []) {
+        $started=microtime(true);
         $payload = json_encode([
             'method' => $method,
             'params' => $params,
@@ -3396,22 +3467,32 @@ class JsonRpcClient {
                 //    if (strpos($e->getMessage(),'"code":-8')===false) {
                 //    if (strpos($e->getMessage(),'"code":-1')===false) {
         if ($response === false) {
-            return $this->handleError("CURL error: " . curl_error($ch));
+            $curlCode=(int)curl_errno($ch);
+            $curlError=preg_replace('/[\r\n]+/',' ',substr((string)curl_error($ch),0,256));
+            $durationMs=(int)round((microtime(true)-$started)*1000);
+            $error=$curlCode===CURLE_OPERATION_TIMEDOUT?'CORE_RPC_TIMEOUT':'CORE_RPC_UNAVAILABLE';
+            curl_close($ch);
+            return $this->handleError("Core RPC transport failure: source=internal method=$method error=$error curlCode=$curlCode durationMs=$durationMs detail=$curlError","transport:$method:$error:$curlCode");
         }
+        curl_close($ch);
         $decoded = json_decode($response, true);
         if (isset($decoded['error']) && $decoded['error'] !== null) {
             $err = $decoded['error'];
             if (in_array($err['code'], [-8, -1])) { // Expected "not ready yet"
                 return $err['code'];
             }
-            return $this->handleError("RPC error: " . json_encode($decoded['error']));
+            return $this->handleError("Core RPC rejection: source=internal method=$method response=" . json_encode($decoded['error']),"rejection:$method:" . json_encode($decoded['error']));
         }
+        if ($this->last_error!=="") {rpcLog("Core RPC recovered: source=internal method=$method failures=".($this->repeat_error+1));}
         $this->repeat_error = 0;
         $this->last_error   = "";
         return $decoded['result'];
     }
-    public function callResult($method,$params=[]) {
+    public function callResult($method,$params=[],$source='service',$logFailure=true,$timeout=6) {
         $started=microtime(true);
+        $timeout=max(1,min(30,(int)$timeout));
+        $source=preg_replace('/[^A-Za-z0-9._-]/','',substr((string)$source,0,48));
+        if ($source==='') {$source='service';}
         $payload=json_encode([
             'method'=>$method,
             'params'=>$params,
@@ -3427,42 +3508,53 @@ class JsonRpcClient {
             CURLOPT_POST=>true,
             CURLOPT_HTTPHEADER=>['Content-Type: application/json'],
             CURLOPT_POSTFIELDS=>$payload,
-            CURLOPT_CONNECTTIMEOUT=>2,
-            CURLOPT_TIMEOUT=>6
+            CURLOPT_CONNECTTIMEOUT=>min(2,$timeout),
+            CURLOPT_TIMEOUT=>$timeout
         ]);
         $response=curl_exec($ch);
         $httpCode=(int)curl_getinfo($ch,CURLINFO_HTTP_CODE);
         if ($response===false) {
+            $curlCode=(int)curl_errno($ch);
+            $curlError=substr((string)curl_error($ch),0,256);
             curl_close($ch);
-            return ['technical'=>true,'ok'=>false,'error'=>'CORE_RPC_UNAVAILABLE','durationMs'=>(int)round((microtime(true)-$started)*1000)];
+            $error=$curlCode===CURLE_OPERATION_TIMEDOUT?'CORE_RPC_TIMEOUT':'CORE_RPC_UNAVAILABLE';
+            $durationMs=(int)round((microtime(true)-$started)*1000);
+            $logDetail=preg_replace('/[\r\n]+/',' ',$curlError);
+            if ($logFailure) {rpcLog("Core RPC transport failure: source=$source method=$method error=$error curlCode=$curlCode durationMs=$durationMs detail=$logDetail");}
+            return ['technical'=>true,'ok'=>false,'error'=>$error,'curlCode'=>$curlCode,'detail'=>$curlError,'durationMs'=>$durationMs];
         }
         curl_close($ch);
 
         $decoded=json_decode($response,true);
         $durationMs=(int)round((microtime(true)-$started)*1000);
         if (!is_array($decoded) || (!array_key_exists('result',$decoded) && !array_key_exists('error',$decoded))) {
+            if ($logFailure) {rpcLog("Core RPC response failure: source=$source method=$method error=INVALID_CORE_RESPONSE httpCode=$httpCode durationMs=$durationMs");}
             return ['technical'=>true,'ok'=>false,'error'=>'INVALID_CORE_RESPONSE','durationMs'=>$durationMs];
         }
         if ($httpCode!==0 && $httpCode!==200 && $httpCode!==500) {
+            if ($logFailure) {rpcLog("Core RPC response failure: source=$source method=$method error=CORE_HTTP_ERROR httpCode=$httpCode durationMs=$durationMs");}
             return ['technical'=>true,'ok'=>false,'error'=>'CORE_HTTP_ERROR','durationMs'=>$durationMs];
         }
         if (isset($decoded['error']) && $decoded['error']!==null) {
             $rpcCode=isset($decoded['error']['code'])?(int)$decoded['error']['code']:0;
             $rpcMessage=isset($decoded['error']['message'])?(string)$decoded['error']['message']:'Core rejected the request';
             if ($rpcCode===-28) {
+                if ($logFailure) {rpcLog("Core RPC response failure: source=$source method=$method error=CORE_NOT_READY rpcCode=$rpcCode durationMs=$durationMs");}
                 return ['technical'=>true,'ok'=>false,'error'=>'CORE_NOT_READY','durationMs'=>$durationMs];
             }
             return ['technical'=>false,'ok'=>false,'rpcCode'=>$rpcCode,'rpcMessage'=>substr($rpcMessage,0,512),'durationMs'=>$durationMs];
         }
         if ($httpCode!==0 && $httpCode!==200) {
+            if ($logFailure) {rpcLog("Core RPC response failure: source=$source method=$method error=CORE_HTTP_ERROR httpCode=$httpCode durationMs=$durationMs");}
             return ['technical'=>true,'ok'=>false,'error'=>'CORE_HTTP_ERROR','durationMs'=>$durationMs];
         }
         return ['technical'=>false,'ok'=>true,'result'=>$decoded['result'],'durationMs'=>$durationMs];
     }
-    private function handleError($msg) {
-        if ($this->last_error !== $msg) {
-            L("Caught exception: " . $msg);
-            $this->last_error   = $msg;
+    private function handleError($msg,$key=null) {
+        $errorKey=$key===null?$msg:$key;
+        if ($this->last_error !== $errorKey) {
+            rpcLog("Caught exception: " . $msg);
+            $this->last_error   = $errorKey;
             $this->repeat_error = 0;
         } else {
             if ($this->repeat_error < 60) {
