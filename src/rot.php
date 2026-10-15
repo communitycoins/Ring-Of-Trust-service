@@ -1,8 +1,14 @@
 <?php
-/* [CC-ROT_0_8-13]
-ROT 0.8.13 recoverable decoded-block transaction RPC handling.
-Base: - Derived from CC-ROT_0_8-12 / ROT 0.8.12
+/* [CC-ROT_0_8-14]
+ROT 0.8.14 safe registration diagnostics and internal RPC recovery reporting.
+Base: - Derived from CC-ROT_0_8-13 / ROT 0.8.13 / c308e5de1004e5a58266fd96368e695560d29773
 Changes:
+- [CC-ROT_0_8-14] Distinguish registration HTTP errors and invalid HTTP 201 fields without exposing secrets
+- Only copy explicitly allowed remote error codes into registration diagnostics
+- Clear internal RPC failure state on expected Core -8 and -1 responses
+- Report internal callsite, failed-call count, wall time, RPC time and backoff time
+- Reject malformed internal RPC responses without falsely reporting recovery
+- Preserve registration backoff, daemon polling and the 0.8.13 decoded-block recovery path
 - [CC-ROT_0_8-13] Retry technical getrawtransaction failures during decoded-block indexing
 - Treat RPC -5 as temporary transaction-index lag only when indexing a decoded block
 - Preserve the two-second block RPC timeout and cap total recovery at thirty seconds
@@ -164,7 +170,7 @@ if ($corePath===$rotPath || strpos($rotPrefix,$corePrefix)===0 || strpos($corePr
 }
 $datadir=$corePath;
 $rotDataDir=$rotPath;
-define ("VERSION","0.8.13");
+define ("VERSION","0.8.14");
 define ("BLOCK_RPC_TIMEOUT",2);
 define ("BLOCK_RPC_RECOVERY_LIMIT",30);
 define ("MAX_PUBS",51);
@@ -421,7 +427,7 @@ foreach (extractBlocksFromStream() as $entry) {
             recover();
             $height=$parseContext['height'];
             while (true) {
-                $lastBlockHash = $RPC->call('getblockhash', [$height]);
+                $lastBlockHash = $RPC->call('getblockhash', [$height], 'rewind-chain-hash');
                 if ($lastBlockHash!==null) {break;}
             }
             $height++;
@@ -431,7 +437,7 @@ foreach (extractBlocksFromStream() as $entry) {
             recover();
             $height=$parseContext['height'];
             while (true) {
-                $lastBlockHash = $RPC->call('getblockhash', [$height]);
+                $lastBlockHash = $RPC->call('getblockhash', [$height], 'rewind-test-hash');
                 if ($lastBlockHash!==null) {break;}
             }
             $height++;
@@ -901,14 +907,64 @@ function handleDirectoryResponse(array $meta,$httpCode,$raw) {
     L("Proxy directory updated: ".count($directory)." active");
 }
 
+function registrationHttpFailure($httpCode,$raw) {
+    $reason='REGISTER_HTTP_'.(int)$httpCode;
+    $decoded=is_string($raw) && strlen($raw)<=REGISTRATION_RESPONSE_BYTES?json_decode($raw,true):null;
+    if (!is_array($decoded)) {return $reason.'_NON_JSON_RESPONSE';}
+    if (!isset($decoded['error']) || !is_string($decoded['error'])) {return $reason.'_NO_ERROR_CODE';}
+    // Never log arbitrary remote strings: even an error field can contain a secret.
+    $allowed=[
+        'HTTPS_REQUIRED','INVALID_REGISTRATION','REGISTRATION_DISABLED',
+        'REGISTRATION_COOLDOWN','REGISTRATION_LIMIT','AUTH_TOKEN_FAILED',
+        'OPERATOR_CONFIGURATION_REQUIRED','OPERATOR_CONFIGURATION_INVALID',
+        'REGISTRY_DIRECTORY_UNAVAILABLE','REGISTRY_PATH_UNVERIFIED','REGISTRY_INSIDE_WEBROOT',
+        'REGISTRY_FILE_UNAVAILABLE','REGISTRY_TEMP_NAME_FAILED','REGISTRY_TEMP_UNAVAILABLE',
+        'REGISTRY_WRITE_FAILED','REGISTRY_ENCODE_FAILED','REGISTRY_UNAVAILABLE','REGISTRY_CORRUPT',
+        'REGISTRY_LOCK_UNAVAILABLE','REGISTRY_LOCK_FAILED','REGISTRY_MANIFEST_CORRUPT',
+        'REGISTRY_COIN_STATE_CORRUPT','REGISTRY_INVALID_ROT_RECORD','REGISTRY_IP_FAILURES_CORRUPT',
+        'CROSS_ORIGIN_REQUEST','METHOD_NOT_ALLOWED','REQUEST_TOO_LARGE','INVALID_JSON'
+    ];
+    return $reason.'_'.(in_array($decoded['error'],$allowed,true)?$decoded['error']:'UNKNOWN_ERROR_CODE');
+}
+
+function registrationResponseFailure(array $record,$decoded) {
+    global $rotId,$rotNickname,$tikker;
+
+    if (!is_array($decoded)) {return 'REGISTER_201_INVALID_JSON';}
+    $required=[
+        'ok'=>'OK','protocol'=>'PROTOCOL','proxyId'=>'PROXY_ID','rotId'=>'ROT_ID',
+        'nickname'=>'NICKNAME','coin'=>'COIN','status'=>'STATUS','authToken'=>'AUTH_TOKEN',
+        'expiresIn'=>'EXPIRES_IN','timestampTolerance'=>'TIMESTAMP_TOLERANCE'
+    ];
+    foreach ($required as $field=>$label) {
+        if (!isset($decoded[$field])) {return 'REGISTER_201_MISSING_'.$label;}
+    }
+    if ($decoded['ok']!==true) {return 'REGISTER_201_INVALID_OK';}
+    if ($decoded['protocol']!==1) {return 'REGISTER_201_INVALID_PROTOCOL';}
+    if (!is_string($decoded['proxyId']) || !hash_equals($record['proxyId'],$decoded['proxyId'])) {return 'REGISTER_201_INVALID_PROXY_ID';}
+    if (!is_string($decoded['rotId']) || !hash_equals($rotId,$decoded['rotId'])) {return 'REGISTER_201_INVALID_ROT_ID';}
+    if (!is_string($decoded['nickname']) || !hash_equals($rotNickname,$decoded['nickname'])) {return 'REGISTER_201_INVALID_NICKNAME';}
+    if ($decoded['coin']!==$tikker) {return 'REGISTER_201_INVALID_COIN';}
+    if ($decoded['status']!=='CANDIDATE') {return 'REGISTER_201_INVALID_STATUS';}
+    if (!is_string($decoded['authToken']) || !preg_match('/^[0-9a-f]{64}$/',$decoded['authToken'])) {return 'REGISTER_201_INVALID_AUTH_TOKEN';}
+    if (!is_int($decoded['expiresIn']) || $decoded['expiresIn']<1) {return 'REGISTER_201_INVALID_EXPIRES_IN';}
+    if (!is_int($decoded['timestampTolerance']) || $decoded['timestampTolerance']<30 || $decoded['timestampTolerance']>600) {return 'REGISTER_201_INVALID_TIMESTAMP_TOLERANCE';}
+    return '';
+}
+
 function handleRegisterResponse(array $meta,$httpCode,$raw) {
     global $registrationManager,$rotId,$rotNickname,$tikker;
 
     if (!isset($meta['proxyId'],$registrationManager['state']['proxies'][$meta['proxyId']])) {return;}
     $record=&$registrationManager['state']['proxies'][$meta['proxyId']];
+    if ($httpCode!==201) {
+        failRegistrationJob($meta,registrationHttpFailure($httpCode,$raw));
+        return;
+    }
     $decoded=json_decode($raw,true);
-    if ($httpCode!==201 || !is_array($decoded) || !isset($decoded['ok'],$decoded['protocol'],$decoded['proxyId'],$decoded['rotId'],$decoded['nickname'],$decoded['coin'],$decoded['status'],$decoded['authToken'],$decoded['expiresIn'],$decoded['timestampTolerance']) || $decoded['ok']!==true || $decoded['protocol']!==1 || !hash_equals($record['proxyId'],$decoded['proxyId']) || !hash_equals($rotId,$decoded['rotId']) || !hash_equals($rotNickname,$decoded['nickname']) || $decoded['coin']!==$tikker || $decoded['status']!=='CANDIDATE' || !is_string($decoded['authToken']) || !preg_match('/^[0-9a-f]{64}$/',$decoded['authToken']) || !is_int($decoded['expiresIn']) || $decoded['expiresIn']<1 || !is_int($decoded['timestampTolerance']) || $decoded['timestampTolerance']<30 || $decoded['timestampTolerance']>600) {
-        failRegistrationJob($meta,'INVALID_REGISTER_RESPONSE');
+    $failure=registrationResponseFailure($record,$decoded);
+    if ($failure!=='') {
+        failRegistrationJob($meta,$failure);
         return;
     }
     $record['authToken']=$decoded['authToken'];
@@ -1277,14 +1333,14 @@ function extractBlocksFromStream(): Generator {
                 $blkvalid++;
             } else { // Turn to RPC
                 while (true) {
-                    $blockHash     = $RPC->call('getblockhash',[$height]);
+                    $blockHash     = $RPC->call('getblockhash',[$height], 'chain-tip-hash');
                     if ($blockHash<0) {
                         break;
                     } elseif ($blockHash!==null) {break;}   // new block
                 }
                 if ($blockHash<0) {break;} // no block yet
                 while (true){
-                    $rpcBlock=$RPC->call('getblock',[$blockHash,$coinProperties['rpcBlockVerbosity']]);
+                    $rpcBlock=$RPC->call('getblock',[$blockHash,$coinProperties['rpcBlockVerbosity']], 'chain-tip-block');
                     if ($rpcBlock!==null) {break;}
                 }
                 $newHeight     = $height;
@@ -1307,7 +1363,7 @@ function extractBlocksFromStream(): Generator {
                 if (!$tipReached) {
                     if ($height>=$top) {
                         while(true) {
-                            $top=$RPC->call('getblockcount',[]);
+                            $top=$RPC->call('getblockcount',[], 'chain-tip-height');
                             if ($top!==null) {break;}
                         }
                         if ($height-1==$top) {$tipReached=true;} // height is the next block we are waiting for
@@ -1439,7 +1495,7 @@ function loadBackupCandidate($postfix,$full=false) {
 function backupIsCanonical(array $candidate) {
     global $RPC;
     while (true) {
-        $hash=$RPC->call('getblockhash',[$candidate['context']['height']]);
+        $hash=$RPC->call('getblockhash',[$candidate['context']['height']], 'backup-checkpoint');
         if ($hash!==null) {break;}
     }
     return is_string($hash) && hash_equals($candidate['context']['hash'],$hash);
@@ -2833,16 +2889,16 @@ class BlockIndex { /* loads all blockhashes through RPC;
         $blockTip=[];
         $once=true;
         while (true) {
-            $tipHash   = $RPC->call('getbestblockhash', []);
+            $tipHash   = $RPC->call('getbestblockhash', [], 'sync-tip-hash');
             if ($tipHash!==null) {break;}
         }
         while (true) {
             while (true) {
-                $tipHash   = $RPC->call('getbestblockhash', []);
+                $tipHash   = $RPC->call('getbestblockhash', [], 'sync-tip-hash');
                 if ($tipHash!==null) {break;}
             }
             while (true) {
-                $blockTip = $RPC->call('getblock', [$tipHash]);
+                $blockTip = $RPC->call('getblock', [$tipHash], 'sync-tip-block');
                 if ($blockTip!==null) {break;}
             }
             $lag       = time() - $blockTip['time'];
@@ -3442,12 +3498,20 @@ class JsonRpcClient {
     private $id = 0;
     private $repeat_error = 0;
     private $last_error   = "";
+    private $errorStartedAt = 0;
+    private $errorMethod = '';
+    private $errorCallsite = '';
+    private $errorFailures = 0;
+    private $errorRpcMs = 0;
+    private $errorBackoffMs = 0;
 
     public function __construct(array $rpc) {
         $this->url = "http://{$rpc['user']}:{$rpc['pass']}@{$rpc['host']}:{$rpc['port']}/";
     }
-    public function call($method, $params = []) {
+    public function call($method, $params = [], $callsite = 'internal') {
         $started=microtime(true);
+        $callsite=preg_replace('/[^A-Za-z0-9._-]/','',substr((string)$callsite,0,48));
+        if ($callsite==='') {$callsite='internal';}
         $payload = json_encode([
             'method' => $method,
             'params' => $params,
@@ -3464,29 +3528,55 @@ class JsonRpcClient {
         ]);
 
         $response = curl_exec($ch);
-                //    if (strpos($e->getMessage(),'"code":-8')===false) {
-                //    if (strpos($e->getMessage(),'"code":-1')===false) {
+        $httpCode=(int)curl_getinfo($ch,CURLINFO_HTTP_CODE);
+        $durationMs=(int)round((microtime(true)-$started)*1000);
         if ($response === false) {
             $curlCode=(int)curl_errno($ch);
             $curlError=preg_replace('/[\r\n]+/',' ',substr((string)curl_error($ch),0,256));
-            $durationMs=(int)round((microtime(true)-$started)*1000);
             $error=$curlCode===CURLE_OPERATION_TIMEDOUT?'CORE_RPC_TIMEOUT':'CORE_RPC_UNAVAILABLE';
             curl_close($ch);
-            return $this->handleError("Core RPC transport failure: source=internal method=$method error=$error curlCode=$curlCode durationMs=$durationMs detail=$curlError","transport:$method:$error:$curlCode");
+            return $this->handleError("Core RPC transport failure: source=internal method=$method callsite=$callsite error=$error curlCode=$curlCode durationMs=$durationMs detail=$curlError","transport:$method:$callsite:$error:$curlCode",$method,$callsite,$started,$durationMs);
         }
         curl_close($ch);
+        if ($httpCode!==0 && $httpCode!==200 && $httpCode!==500) {
+            return $this->handleError("Core RPC response failure: source=internal method=$method callsite=$callsite error=CORE_HTTP_ERROR httpCode=$httpCode durationMs=$durationMs","http:$method:$callsite:$httpCode",$method,$callsite,$started,$durationMs);
+        }
         $decoded = json_decode($response, true);
+        if (!is_array($decoded) || (!array_key_exists('result',$decoded) && !isset($decoded['error']))) {
+            return $this->handleError("Core RPC response failure: source=internal method=$method callsite=$callsite error=INVALID_CORE_RESPONSE httpCode=$httpCode durationMs=$durationMs","response:$method:$callsite",$method,$callsite,$started,$durationMs);
+        }
         if (isset($decoded['error']) && $decoded['error'] !== null) {
             $err = $decoded['error'];
-            if (in_array($err['code'], [-8, -1])) { // Expected "not ready yet"
+            if (!is_array($err) || !isset($err['code']) || !is_int($err['code'])) {
+                return $this->handleError("Core RPC response failure: source=internal method=$method callsite=$callsite error=INVALID_CORE_RESPONSE httpCode=$httpCode durationMs=$durationMs","response:$method:$callsite",$method,$callsite,$started,$durationMs);
+            }
+            if (in_array($err['code'], [-8, -1],true)) { // Expected "not ready yet"
+                $this->finishInternalRecovery($method,$callsite,'expected-error',$durationMs,$err['code']);
                 return $err['code'];
             }
-            return $this->handleError("Core RPC rejection: source=internal method=$method response=" . json_encode($decoded['error']),"rejection:$method:" . json_encode($decoded['error']));
+            return $this->handleError("Core RPC rejection: source=internal method=$method callsite=$callsite rpcCode={$err['code']} durationMs=$durationMs","rejection:$method:$callsite:{$err['code']}",$method,$callsite,$started,$durationMs);
         }
-        if ($this->last_error!=="") {rpcLog("Core RPC recovered: source=internal method=$method failures=".($this->repeat_error+1));}
+        if ($httpCode!==0 && $httpCode!==200) {
+            return $this->handleError("Core RPC response failure: source=internal method=$method callsite=$callsite error=CORE_HTTP_ERROR httpCode=$httpCode durationMs=$durationMs","http:$method:$callsite:$httpCode",$method,$callsite,$started,$durationMs);
+        }
+        $this->finishInternalRecovery($method,$callsite,'result',$durationMs);
+        return $decoded['result'];
+    }
+    private function finishInternalRecovery($method,$callsite,$outcome,$durationMs,$rpcCode=null) {
+        if ($this->last_error!=="") {
+            $elapsedMs=(int)round((microtime(true)-$this->errorStartedAt)*1000);
+            $rpcMs=$this->errorRpcMs+$durationMs;
+            $expected=$rpcCode===null?'':' rpcCode='.$rpcCode;
+            rpcLog("Core RPC recovered: source=internal method=$method callsite=$callsite failedMethod={$this->errorMethod} failedCallsite={$this->errorCallsite} failures={$this->errorFailures} outcome=$outcome$expected elapsedMs=$elapsedMs rpcMs=$rpcMs backoffMs={$this->errorBackoffMs} durationMs=$durationMs");
+        }
         $this->repeat_error = 0;
         $this->last_error   = "";
-        return $decoded['result'];
+        $this->errorStartedAt=0;
+        $this->errorMethod='';
+        $this->errorCallsite='';
+        $this->errorFailures=0;
+        $this->errorRpcMs=0;
+        $this->errorBackoffMs=0;
     }
     public function callResult($method,$params=[],$source='service',$logFailure=true,$timeout=6) {
         $started=microtime(true);
@@ -3550,23 +3640,33 @@ class JsonRpcClient {
         }
         return ['technical'=>false,'ok'=>true,'result'=>$decoded['result'],'durationMs'=>$durationMs];
     }
-    private function handleError($msg,$key=null) {
+    private function handleError($msg,$key=null,$method='',$callsite='',$started=0,$durationMs=0) {
         $errorKey=$key===null?$msg:$key;
         if ($this->last_error !== $errorKey) {
             rpcLog("Caught exception: " . $msg);
             $this->last_error   = $errorKey;
             $this->repeat_error = 0;
+            $this->errorStartedAt=$started;
+            $this->errorMethod=$method;
+            $this->errorCallsite=$callsite;
+            $this->errorFailures=0;
+            $this->errorRpcMs=0;
+            $this->errorBackoffMs=0;
         } else {
             if ($this->repeat_error < 60) {
                 $this->repeat_error++;
             }
             L(".");
         }
+        $this->errorFailures++;
+        $this->errorRpcMs+=$durationMs;
+        $waitStarted=microtime(true);
         if ($this->repeat_error > 10) {
             sleep($this->repeat_error);
         } else {
             sleep(1);
         }
+        $this->errorBackoffMs+=(int)round((microtime(true)-$waitStarted)*1000);
         return null;
     }
     public function batch(array $calls): array {
