@@ -1,8 +1,13 @@
 <?php
-/* [CC-ROT_0_8-14]
-ROT 0.8.14 safe registration diagnostics and internal RPC recovery reporting.
-Base: - Derived from CC-ROT_0_8-13 / ROT 0.8.13 / c308e5de1004e5a58266fd96368e695560d29773
+/* [CC-WALLET_ROT-SUPPORT-201]
+ROT 0.8.15 decoded-block reorganisation recovery and registration version reporting.
+Base: - Derived from CC-WALLET_ROT-SUPPORT-147 / CC-ROT_0_8-14
 Changes:
+- [CC-WALLET_ROT-SUPPORT-201] Recheck decoded RPC blocks when a transaction disappears during parsing
+- Discard an uncommitted orphaned block and refetch the same height without terminating ROT
+- Confirm decoded-block canonicality before committing parsed transactions
+- Include the ROT software version in new proxy-registration requests
+- Preserve bounded registration-limit reason diagnostics from CC-WALLET_ROT-SUPPORT-147
 - [CC-ROT_0_8-14] Distinguish registration HTTP errors and invalid HTTP 201 fields without exposing secrets
 - Only copy explicitly allowed remote error codes into registration diagnostics
 - Clear internal RPC failure state on expected Core -8 and -1 responses
@@ -170,7 +175,7 @@ if ($corePath===$rotPath || strpos($rotPrefix,$corePrefix)===0 || strpos($corePr
 }
 $datadir=$corePath;
 $rotDataDir=$rotPath;
-define ("VERSION","0.8.14");
+define ("VERSION","0.8.15");
 define ("BLOCK_RPC_TIMEOUT",2);
 define ("BLOCK_RPC_RECOVERY_LIMIT",30);
 define ("MAX_PUBS",51);
@@ -470,11 +475,17 @@ foreach (extractBlocksFromStream() as $entry) {
             }
         }
 
-        $lastBlockHash=$entry['hash'];
         if (($height>=$BLOCKINDEX->backupHeight) && (($height%$BLOCKINDEX->maxReorgDepth)==0)) {
             backup(false,$height-1,$entry['prevHash']); // The arriving block is not indexed yet
         }
-        $parsed = $parser->getBlock($entry['raw']);
+        try {
+            $parsed = $parser->getBlock($entry['raw'],$entry['hash']);
+        } catch (StaleBlockException $exception) {
+            $lastBlockHash=$entry['prevHash'];
+            L("Discarded orphaned block {$entry['hash']} at height $height; retrying canonical height\n");
+            continue 2;
+        }
+        $lastBlockHash=$entry['hash'];
 /// fresh parsed block
 
         $skipped+=$parsed['skipped'];
@@ -924,7 +935,12 @@ function registrationHttpFailure($httpCode,$raw) {
         'REGISTRY_COIN_STATE_CORRUPT','REGISTRY_INVALID_ROT_RECORD','REGISTRY_IP_FAILURES_CORRUPT',
         'CROSS_ORIGIN_REQUEST','METHOD_NOT_ALLOWED','REQUEST_TOO_LARGE','INVALID_JSON'
     ];
-    return $reason.'_'.(in_array($decoded['error'],$allowed,true)?$decoded['error']:'UNKNOWN_ERROR_CODE');
+    $error=in_array($decoded['error'],$allowed,true)?$decoded['error']:'UNKNOWN_ERROR_CODE';
+    if ($httpCode===429 && $error==='REGISTRATION_LIMIT' && isset($decoded['reason']) && is_string($decoded['reason'])) {
+        $limitReasons=['ROT_ID_IP_CONFLICT','CAPACITY_REACHED','IP_LIMIT_REACHED'];
+        if (in_array($decoded['reason'],$limitReasons,true)) {$error.='_'.$decoded['reason'];}
+    }
+    return $reason.'_'.$error;
 }
 
 function registrationResponseFailure(array $record,$decoded) {
@@ -1089,6 +1105,7 @@ function startProxyRegistration(array $record) {
         'coin'=>$tikker,
         'rotId'=>$rotId,
         'nickname'=>$rotNickname,
+        'rotVersion'=>VERSION,
         'port'=>(int)SOCKET
     ],['proxyId'=>$record['proxyId']]);
 }
@@ -2908,6 +2925,32 @@ class BlockIndex { /* loads all blockhashes through RPC;
     }
 }
 
+function blockCanonicality($expectedBlockHash) {
+    global $height,$RPC;
+
+    if (!is_string($expectedBlockHash) || !preg_match('/^[0-9a-fA-F]{64}$/',$expectedBlockHash)) {
+        throw new \UnexpectedValueException("Invalid expected block hash at height $height");
+    }
+    $response=$RPC->callResult('getblockhash',[$height],'block-index-canonicality',false,BLOCK_RPC_TIMEOUT);
+    if ($response['technical']) {
+        return ['known'=>false,'canonical'=>false,'currentHash'=>''];
+    }
+    if (!$response['ok']) {
+        $rpcCode=isset($response['rpcCode'])?(int)$response['rpcCode']:0;
+        if (in_array($rpcCode,[-8,-1],true)) {
+            return ['known'=>true,'canonical'=>false,'currentHash'=>''];
+        }
+        throw new \UnexpectedValueException("Core rejected block canonicality check at height $height, RPC $rpcCode");
+    }
+    $currentHash=isset($response['result'])?strtolower((string)$response['result']):'';
+    if (!preg_match('/^[0-9a-f]{64}$/',$currentHash)) {
+        throw new \UnexpectedValueException("Invalid canonical block hash at height $height");
+    }
+    return ['known'=>true,'canonical'=>hash_equals(strtolower($expectedBlockHash),$currentHash),'currentHash'=>$currentHash];
+}
+
+class StaleBlockException extends \RuntimeException {}
+
 class BlockParser { /* Unravels a binary block */
     private function waitForRpcRetry($seconds): void {
         $deadline=microtime(true)+max(1,(int)$seconds);
@@ -2917,7 +2960,17 @@ class BlockParser { /* Unravels a binary block */
         } while (microtime(true)<$deadline);
         registrationTick();
     }
-    private function fetchDecodedTransaction($txid): string {
+    private function requireCanonicalBlock($expectedBlockHash,$txid=''): void {
+        global $height,$tikker;
+
+        $status=blockCanonicality($expectedBlockHash);
+        if (!$status['known'] || $status['canonical']) {return;}
+        $currentHash=$status['currentHash']===''?'unavailable':$status['currentHash'];
+        $transaction=$txid===''?'':' txid='.$txid;
+        rpcLog("Block reorganisation detected: source=block-index coin=$tikker height=$height expectedHash=$expectedBlockHash currentHash=$currentHash$transaction");
+        throw new StaleBlockException("Decoded block is no longer canonical at height $height");
+    }
+    private function fetchDecodedTransaction($txid,$expectedBlockHash): string {
         global $height,$RPC,$tikker;
 
         $failures=0;
@@ -2930,6 +2983,7 @@ class BlockParser { /* Unravels a binary block */
                 if ($rpcCode!==-5) {
                     throw new \UnexpectedValueException("Core rejected raw transaction at height $height, txid $txid, RPC $rpcCode: $rpcMessage");
                 }
+                $this->requireCanonicalBlock($expectedBlockHash,$txid);
                 $response['technical']=true;
                 $response['error']='CORE_TRANSACTION_NOT_INDEXED';
                 $response['detail']=$rpcMessage;
@@ -2968,17 +3022,20 @@ class BlockParser { /* Unravels a binary block */
             $this->waitForRpcRetry($wait);
         }
     }
-    public function getBlock($buffer): array {
+    public function getBlock($buffer,$expectedBlockHash=''): array {
         global $height,$RPC;
         $skipped=0;
         $transactions = [];
         if (is_array ($buffer)) { // decoded json
+            if (!is_string($expectedBlockHash) || !preg_match('/^[0-9a-fA-F]{64}$/',$expectedBlockHash)) {
+                throw new \UnexpectedValueException("Missing decoded block hash at height $height");
+            }
             $txCount=count($buffer['tx']);
             for ($i = 0; $i < $txCount; $i++) {
                 $txid=$buffer['tx'][$i];
                 if (!is_string($txid) || !preg_match('/^[0-9a-fA-F]{64}$/',$txid)) {throw new \UnexpectedValueException("Invalid transaction id at height $height");}
                 $txid=strtolower($txid);
-                $txHex=$this->fetchDecodedTransaction($txid);
+                $txHex=$this->fetchDecodedTransaction($txid,$expectedBlockHash);
                 $txBin=hex2bin($txHex);
                 if ($txBin===false) {throw new \UnexpectedValueException("Invalid raw transaction at height $height, txid $txid");}
                 $offset=0;
@@ -2986,6 +3043,7 @@ class BlockParser { /* Unravels a binary block */
                 if ($tx['is_relevant']) {$transactions[] = $tx;} else {$skipped++;}
                 $offset += $tx['length'];
             }
+            $this->requireCanonicalBlock($expectedBlockHash);
         } else {
             $this->requireBytes($buffer,0,80,'block header');
             $offset = 0;
