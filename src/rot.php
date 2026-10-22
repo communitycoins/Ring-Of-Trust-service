@@ -1,21 +1,47 @@
 <?php
-/* [CC-WALLET-013]
-ROT 0.8.9 startup visibility correction for protected operator status.
-Base: - Derived from CC-WALLET-012 / ROT 0.8.8
+/* [CC-WALLET_ROT-SUPPORT-201]
+ROT 0.8.15 decoded-block reorganisation recovery and registration version reporting.
+Base: - Derived from CC-WALLET_ROT-SUPPORT-147 / CC-ROT_0_8-14
 Changes:
-- [CC-WALLET-013] Log invalid or exposed operator-secret failures through the normal ROT log before exit
-- [CC-WALLET-012] Register with every eligible advertised proxy by default, capped at ten
+- [CC-WALLET_ROT-SUPPORT-201] Recheck decoded RPC blocks when a transaction disappears during parsing
+- Discard an uncommitted orphaned block and refetch the same height without terminating ROT
+- Confirm decoded-block canonicality before committing parsed transactions
+- Include the ROT software version in new proxy-registration requests
+- Preserve bounded registration-limit reason diagnostics from CC-WALLET_ROT-SUPPORT-147
+- [CC-ROT_0_8-14] Distinguish registration HTTP errors and invalid HTTP 201 fields without exposing secrets
+- Only copy explicitly allowed remote error codes into registration diagnostics
+- Clear internal RPC failure state on expected Core -8 and -1 responses
+- Report internal callsite, failed-call count, wall time, RPC time and backoff time
+- Reject malformed internal RPC responses without falsely reporting recovery
+- Preserve registration backoff, daemon polling and the 0.8.13 decoded-block recovery path
+- [CC-ROT_0_8-13] Retry technical getrawtransaction failures during decoded-block indexing
+- Treat RPC -5 as temporary transaction-index lag only when indexing a decoded block
+- Preserve the two-second block RPC timeout and cap total recovery at thirty seconds
+- Log timeout source, method and bounded retry/recovery details in rot.log
+- Mirror RPC failure, retry and recovery events to timestamped rpc.log
+- Keep proxy-registration leases responsive while Core RPC recovery is pending
+- Distinguish a temporary Core transport failure from rejection or malformed transaction data
+- [CC-ROT_0_8-12] Correct the PAK P2PKH version byte from 0x00 to 0x37
+- [CC-WALLET-V2-004] Treat Pakcoin getblock responses as decoded JSON and use the boolean txinfo argument
+- [CC-WALLET-V2-003] Define RPC block representation and transaction-layout differences as coin properties
+- Retain boolean false as the getblock txinfo argument for all supported coins
+- Parse the four-byte transaction time used by PAK and DEM without coin-specific parser branches
+- Reject truncated varints and length-prefixed fields before ord(), unpack() or offset advancement
+- Report the actual stream offset and filename in block-read exceptions
+- Remove inherited trailing whitespace so Forgejo can apply the patch without warnings
+- Log invalid or exposed operator-secret failures through the normal ROT log before exit
+- Register with every eligible advertised proxy by default, capped at ten
 - Retain bootstrap registered-ROT counts and signed proxy-reported status latency
 - Require the private per-ROT operator-secret for legacy stat and close silently on failure
-- [CC-WALLET-008] Route authenticated CCP1 wallet commands through the existing public allowlist
+- Route authenticated CCP1 wallet commands through the existing public allowlist
 - Log proxy status only on actual transitions and identify both old and new state
-- [CC-WALLET-007] Create and retain one random rotid per ROT data directory
+- Create and retain one random rotid per ROT data directory
 - Add an optional sanitized nickname and deterministic fallback label
 - Discover proxy registration targets through the CommunityCoins bootstrap
 - Run registration and lease renewal asynchronously through existing cURL multi support
 - Authenticate private CCP1 status requests and return bounded chain checkpoints
 - Persist signed proxy messages and acknowledge them only after local storage
-- [CC-WALLET-006] Buffer partial requests and responses without blocking the single ROT loop
+- Buffer partial requests and responses without blocking the single ROT loop
 - Bound client count, per-client lifetime, request/response size and total socket memory
 - Recalculate stream_select deadlines on every pass and enlarge the listen backlog
 - Restrict the public legacy socket to wallet operations and disable remote diagnostics/stop
@@ -60,7 +86,7 @@ Changes:
 */
 
 /* Its purpose is to build a full legacy blockindex
- 
+
   Goal    : present memory-index for publickey hashes, (un)spend outputs and transaction id's
   Purpose : Engine for SPV-services that serve legacy-only light clients P2PKH-addresses
   Model  : - Reads transaction-blocks streight from blocks/blk*.dat
@@ -77,24 +103,24 @@ Changes:
            - TX-outputs are sequentially linked (no pointer);
            - PUB-TXOs are linked through linked list; Maintain last TXO for fast addition
 
-  [index](size)    
+  [index](size)
   TX_table-bucket(44):  [0]txid(32) + [1]blocknr/lastchange(4) + [2]txo-pointer(4) + [3]collision-linked-list(4)
   PUB_table-bucket(36): [0]scripthash(20) + [1]blocknr/lastchange(4) + [2]first txo(4) + [3]last txo(4) + [4]collision-linked-list(4)
-  TXO_table_bucket(28): [0]txin(4) + [1]nout(4) + [2]value(8) + [3]scripthash(4) + [4]txout/spend(4) + [5]scripthash-txo-linkedlist(4) 
-  
+  TXO_table_bucket(28): [0]txin(4) + [1]nout(4) + [2]value(8) + [3]scripthash(4) + [4]txout/spend(4) + [5]scripthash-txo-linkedlist(4)
+
   +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-   The main loop starts at extractBlocksFromStream(). This is a "generator" and retrieves blocks sequentially but un-ordered from blocks/blk*.dat   
+   The main loop starts at extractBlocksFromStream(). This is a "generator" and retrieves blocks sequentially but un-ordered from blocks/blk*.dat
    since blocks don't occur serially in blk*.dat:
    - class BlockIndex first fetches a serial map of blocks.
    - extractBlocksFromStream loads blocks encountered serially but stores those "out of sync" in $blockbuffer[]
    - Block 0 is skipped
-   
+
    **TXdata** all legacy non-coinbase transactions serialized through parsing of blk*.dat
    **TXidx**  For each block a pointer to the first transaction in **TXdata** for that block plus the amount of relevant transactions in that block
    **BLKidx** for each block a 6-byte pointer into blk*.dat
 
   +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-*/   
+*/
 
 $environmentError='';
 $options = getopt('c:h', ['config:', 'help']);
@@ -149,7 +175,9 @@ if ($corePath===$rotPath || strpos($rotPrefix,$corePrefix)===0 || strpos($corePr
 }
 $datadir=$corePath;
 $rotDataDir=$rotPath;
-define ("VERSION","0.8.9");
+define ("VERSION","0.8.15");
+define ("BLOCK_RPC_TIMEOUT",2);
+define ("BLOCK_RPC_RECOVERY_LIMIT",30);
 define ("MAX_PUBS",51);
 define ("MAX_HISTORY_EVENTS",2000);
 define ("MAX_HISTORY_WALLET_OUTPUTS",4000);
@@ -183,12 +211,29 @@ if (!file_exists(ROOT."data")) {mkdir(ROOT."data");}
 if (file_exists(ROOT."DEBUG")) {define("DEBUG",true);echo "debug mode\n";} else {define("DEBUG",false);}
 
 $alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
-$versionsBytes = ["LTC" => 48,"BTC" => 0x00,"CDN" => 28,"DEM" => 53,"EFL" => 48,"AUR" => 23,"PAK" => 0x00,"SLG" => 0x00,"RUBTC" => 0x00,
-                  "FJC" => 0x00,"BOLI" => 0x00,"CESC" => 0x00];
-$coinUnits = ["LTC" => 100000000,"BTC" => 100000000,"CDN" => 100000000,"DEM" => 1000000,"EFL" => 100000000,"AUR" => 100000000,
-              "PAK" => 100000000,"SLG" => 100000000,"RUBTC" => 100000000,"FJC" => 100000000,"BOLI" => 100000000,"CESC" => 100000000];
+$defaultCoinProperties = [
+    'rpcBlockVerbosity'=>false,
+    'rpcBlockRepresentation'=>'hex',
+    'transactionTimeBytes'=>0,
+    'transactionComment'=>false
+];
+$coinSpecifications = [
+    'LTC'=>['versionByte'=>48,'unitsPerCoin'=>100000000],
+    'BTC'=>['versionByte'=>0x00,'unitsPerCoin'=>100000000],
+    'CDN'=>['versionByte'=>28,'unitsPerCoin'=>100000000],
+    'DEM'=>['versionByte'=>53,'unitsPerCoin'=>1000000,'rpcBlockRepresentation'=>'decoded','transactionTimeBytes'=>4,'transactionComment'=>true],
+    'EFL'=>['versionByte'=>48,'unitsPerCoin'=>100000000],
+    'AUR'=>['versionByte'=>23,'unitsPerCoin'=>100000000],
+    'PAK'=>['versionByte'=>0x37,'unitsPerCoin'=>100000000,'rpcBlockRepresentation'=>'decoded','transactionTimeBytes'=>4],
+    'SLG'=>['versionByte'=>0x00,'unitsPerCoin'=>100000000],
+    'RUBTC'=>['versionByte'=>0x00,'unitsPerCoin'=>100000000],
+    'FJC'=>['versionByte'=>0x00,'unitsPerCoin'=>100000000],
+    'BOLI'=>['versionByte'=>0x00,'unitsPerCoin'=>100000000],
+    'CESC'=>['versionByte'=>0x00,'unitsPerCoin'=>100000000]
+];
 function now(){return date('d-m-Y H:i');}
 function L($what){$extra="";if (($what!=".")&&(substr($what,-1)!="\n")){$extra="\n";}file_put_contents(ROOT."rot.log",$what.$extra,FILE_APPEND);echo $what.$extra;}
+function rpcLog($what){$line=preg_replace('/[\r\n]+/',' ',(string)$what);file_put_contents(ROOT."rpc.log",gmdate('Y-m-d\TH:i:s\Z')." ".$line."\n",FILE_APPEND);L($what);}
 if (!function_exists('array_key_last')) {function array_key_last(array $array) {if (empty($array)) {return null;}return key(array_slice($array, -1, 1, true));}}
 
 $rotId=loadRotId();
@@ -210,9 +255,11 @@ register_shutdown_function(function(){
 $rpchost='127.0.0.1';
 if (strpos($rpcport,":")>0) {list($rpchost,$rpcport)=explode(":",$rpcport);}
 $tikker=strtoupper($tikker);
-if (!isset($versionsBytes[$tikker]) || !isset($coinUnits[$tikker]) || !preg_match('/^10*$/',(string)$coinUnits[$tikker])) {die("Unsupported coin specification\n");}
-$versionByte=$versionsBytes[$tikker];
-$unitsPerCoin=$coinUnits[$tikker];
+if (!isset($coinSpecifications[$tikker])) {die("Unsupported coin specification\n");}
+$coinProperties=array_merge($defaultCoinProperties,$coinSpecifications[$tikker]);
+if (!preg_match('/^10*$/',(string)$coinProperties['unitsPerCoin']) || !in_array($coinProperties['rpcBlockRepresentation'],['hex','decoded'],true) || !in_array($coinProperties['transactionTimeBytes'],[0,4],true) || !is_bool($coinProperties['transactionComment'])) {die("Unsupported coin specification\n");}
+$versionByte=$coinProperties['versionByte'];
+$unitsPerCoin=$coinProperties['unitsPerCoin'];
 $coinDecimals=strlen((string)$unitsPerCoin)-1;
 define ("SOCKET",$socket);
 
@@ -280,11 +327,11 @@ if (!$recovery){
     $parseContext['offset']=0;
     $TX_table['name']           ="TX";
     $TX_table['N']          =10000000;   // hash-positions (4-bytes a piece) -> 40Mb
-    $TX_table['increment']              =100000000;  // increment empty space to prevent frequent reallocations (100 Mb)                                        
+    $TX_table['increment']              =100000000;  // increment empty space to prevent frequent reallocations (100 Mb)
     if (($tikker=='LTC')||($tikker=='BTC')||($tikker=='DOGE')) {$multiplier=10;} else {$multiplier=1;}   // hash-positions -> 400Mb
     $bucketPercentage=1; // reduce memory based on history
     if ($tikker=='EFL') {
-        $bucketPercentage=0.2; 
+        $bucketPercentage=0.2;
     } elseif ($tikker=='CDN') {
         $bucketPercentage=0.5;
     } elseif ($tikker=='AUR') {
@@ -293,8 +340,8 @@ if (!$recovery){
         $bucketPercentage=0.3;
     }
     $TX_table['N']*=$multiplier;
-    $TX_table['increment']*=$multiplier*$bucketPercentage;  
-    
+    $TX_table['increment']*=$multiplier*$bucketPercentage;
+
     $TX_table['hash'][P]=0;
     $TX_table['hash'][FORMAT_PACK]="V";
     $TX_table['hash'][FORMAT_UNPACK]="V";
@@ -302,11 +349,11 @@ if (!$recovery){
     $TX_table['hash'][SIZE]=$TX_table['N']*$TX_table['hash'][RECORDSIZE];
     $TX_table['hash'][TOP]=$TX_table['N']; // De hoogste GEVULDE index
     $TX_table['hash'][NAME]='TX-hash';
-    
+
     $TX_table['bucket'][P]=0;
     $TX_table['bucket'][INCREMENT]=$TX_table['increment'];
-    $TX_table['bucket'][FORMAT_PACK]="a32V3";  
-    $TX_table['bucket'][FORMAT_UNPACK]="a32tx/Vblock/Vtxo/Vnext"; 
+    $TX_table['bucket'][FORMAT_PACK]="a32V3";
+    $TX_table['bucket'][FORMAT_UNPACK]="a32tx/Vblock/Vtxo/Vnext";
     $TX_table['bucket'][RECORDSIZE]=32+3*LONG;
     $TX_table['bucket'][SIZE]=$TX_table['bucket'][INCREMENT]*$bucketPercentage;
     $TX_table['bucket'][TOP]=0;
@@ -315,7 +362,7 @@ if (!$recovery){
     $TX_table['bucket'][KEY]=ftok(__FILE__, 'B');
     hashtable_initialize($TX_table['hash']);
     hashtable_initialize($TX_table['bucket']);
-    
+
     $PUB_table['name']="PUB";
     $PUB_table['hash'][P]=0;
     $PUB_table['hash'][FORMAT_PACK]="V";
@@ -326,7 +373,7 @@ if (!$recovery){
     $PUB_table['hash'][NAME]='PUB-hash';
     $PUB_table['bucket'][P]=0;
     $PUB_table['bucket'][INCREMENT]=$TX_table['increment'];
-    $PUB_table['bucket'][FORMAT_PACK]="a20V4"; 
+    $PUB_table['bucket'][FORMAT_PACK]="a20V4";
     $PUB_table['bucket'][FORMAT_UNPACK]="a20hash/Vblock/Vfirst/Vlast/Vnext"; // Should I maintain balances too? > richlist
     $PUB_table['bucket'][RECORDSIZE]=20+4*LONG;
     $PUB_table['bucket'][SIZE]=$PUB_table['bucket'][INCREMENT]*$bucketPercentage;
@@ -336,12 +383,12 @@ if (!$recovery){
     $PUB_table['bucket'][KEY]=ftok(__FILE__, 'D');
     hashtable_initialize($PUB_table['hash']);
     hashtable_initialize($PUB_table['bucket']);
-    
+
     $TXO_table['name']="TXO";
     $TXO_table['bucket'][P]=0;
     $TXO_table['bucket'][INCREMENT]=$TX_table['increment'];
-    $TXO_table['bucket'][FORMAT_PACK]="V2PV3"; 
-    $TXO_table['bucket'][FORMAT_UNPACK]="Vtxin/Vnout/Pvalue/Vhash/Vtxout/Vnext"; 
+    $TXO_table['bucket'][FORMAT_PACK]="V2PV3";
+    $TXO_table['bucket'][FORMAT_UNPACK]="Vtxin/Vnout/Pvalue/Vhash/Vtxout/Vnext";
     $TXO_table['bucket'][RECORDSIZE]=28;
     $TXO_table['bucket'][SIZE]=$TXO_table['bucket'][INCREMENT]*$bucketPercentage;
     $TXO_table['bucket'][TOP]=0;
@@ -377,7 +424,7 @@ foreach (extractBlocksFromStream() as $entry) {
         $len_buffer=count($blockbuffer);
         L("blk.dat:{$entry['fileNumber']} height:$height seconds:$passed buffer_max:$max_buffer buffer:$len_buffer orphans:$orphan valid:$blkvalid skipped:$skipped relevant:$relevant\n");
     }
-    
+
     if ($raceToTheTop==false) { // Got block through RPC but anticipate reorganisations
         L("New block:".$entry['hash']."; height $height\n");
         if ($entry['prevHash']!=$lastBlockHash) { // There we have one
@@ -385,7 +432,7 @@ foreach (extractBlocksFromStream() as $entry) {
             recover();
             $height=$parseContext['height'];
             while (true) {
-                $lastBlockHash = $RPC->call('getblockhash', [$height]);
+                $lastBlockHash = $RPC->call('getblockhash', [$height], 'rewind-chain-hash');
                 if ($lastBlockHash!==null) {break;}
             }
             $height++;
@@ -395,7 +442,7 @@ foreach (extractBlocksFromStream() as $entry) {
             recover();
             $height=$parseContext['height'];
             while (true) {
-                $lastBlockHash = $RPC->call('getblockhash', [$height]);
+                $lastBlockHash = $RPC->call('getblockhash', [$height], 'rewind-test-hash');
                 if ($lastBlockHash!==null) {break;}
             }
             $height++;
@@ -426,15 +473,21 @@ foreach (extractBlocksFromStream() as $entry) {
                     $TXidx="";$TXdata="";$BLKidx="";
                 }
             }
-        }    
-        
-        $lastBlockHash=$entry['hash'];
+        }
+
         if (($height>=$BLOCKINDEX->backupHeight) && (($height%$BLOCKINDEX->maxReorgDepth)==0)) {
             backup(false,$height-1,$entry['prevHash']); // The arriving block is not indexed yet
         }
-        $parsed = $parser->getBlock($entry['raw']);
-/// fresh parsed block        
-        
+        try {
+            $parsed = $parser->getBlock($entry['raw'],$entry['hash']);
+        } catch (StaleBlockException $exception) {
+            $lastBlockHash=$entry['prevHash'];
+            L("Discarded orphaned block {$entry['hash']} at height $height; retrying canonical height\n");
+            continue 2;
+        }
+        $lastBlockHash=$entry['hash'];
+/// fresh parsed block
+
         $skipped+=$parsed['skipped'];
         $relevant+=count($parsed['transactions']);
         if (!$fullBackup){
@@ -474,7 +527,7 @@ foreach (extractBlocksFromStream() as $entry) {
                     if ($index!==false){
                         // [0]txid(32) + [1]blocknr/lastchange(4) + [2]txo-pointer(4) + [3]next-hash-collision(4)
                         // txo[0]:9 txo[1]:0 txo[2]:2500000000 txo[3]:12 txo[4]:0 txo[5]:0
-                        // [0]txin(4) - [1]nout(4) - [2]value(8) - [3]scripthash(4) - [4]txout/spend(4) - [5]next scripthash txo(4) 
+                        // [0]txin(4) - [1]nout(4) - [2]value(8) - [3]scripthash(4) - [4]txout/spend(4) - [5]next scripthash txo(4)
                         $txo=hashtable_read($TXO_table['bucket'],$record[2]);
                         $i=0;
                         while (($txo[0]==$index)&&($txo[1]<$prev_vout)){
@@ -490,17 +543,17 @@ foreach (extractBlocksFromStream() as $entry) {
                             hashtable_write($TXO_table['bucket'],$record[2]+$i,$txo);
                             $pubcontent=hashtable_read($PUB_table['bucket'],$txo[3]); // mark last change with pubkeyhash
                             $pubcontent[1]=$height;
-                            hashtable_write($PUB_table['bucket'],$txo[3],$pubcontent);                    
-                        } 
+                            hashtable_write($PUB_table['bucket'],$txo[3],$pubcontent);
+                        }
                     }
                 }
             }
             $TX_sum++;
-        }         
+        }
         $height++;
         if ($raceToTheTop) {
             foreach ($blockbuffer as $n => $entry) {
-                if ($entry['id']<$height-$BLOCKINDEX->maxReorgDepth) {unset($blockbuffer[$n]);}                
+                if ($entry['id']<$height-$BLOCKINDEX->maxReorgDepth) {unset($blockbuffer[$n]);}
                 if ($entry['id']==$height) {
                     unset($blockbuffer[$n]);
                     break;
@@ -865,14 +918,69 @@ function handleDirectoryResponse(array $meta,$httpCode,$raw) {
     L("Proxy directory updated: ".count($directory)." active");
 }
 
+function registrationHttpFailure($httpCode,$raw) {
+    $reason='REGISTER_HTTP_'.(int)$httpCode;
+    $decoded=is_string($raw) && strlen($raw)<=REGISTRATION_RESPONSE_BYTES?json_decode($raw,true):null;
+    if (!is_array($decoded)) {return $reason.'_NON_JSON_RESPONSE';}
+    if (!isset($decoded['error']) || !is_string($decoded['error'])) {return $reason.'_NO_ERROR_CODE';}
+    // Never log arbitrary remote strings: even an error field can contain a secret.
+    $allowed=[
+        'HTTPS_REQUIRED','INVALID_REGISTRATION','REGISTRATION_DISABLED',
+        'REGISTRATION_COOLDOWN','REGISTRATION_LIMIT','AUTH_TOKEN_FAILED',
+        'OPERATOR_CONFIGURATION_REQUIRED','OPERATOR_CONFIGURATION_INVALID',
+        'REGISTRY_DIRECTORY_UNAVAILABLE','REGISTRY_PATH_UNVERIFIED','REGISTRY_INSIDE_WEBROOT',
+        'REGISTRY_FILE_UNAVAILABLE','REGISTRY_TEMP_NAME_FAILED','REGISTRY_TEMP_UNAVAILABLE',
+        'REGISTRY_WRITE_FAILED','REGISTRY_ENCODE_FAILED','REGISTRY_UNAVAILABLE','REGISTRY_CORRUPT',
+        'REGISTRY_LOCK_UNAVAILABLE','REGISTRY_LOCK_FAILED','REGISTRY_MANIFEST_CORRUPT',
+        'REGISTRY_COIN_STATE_CORRUPT','REGISTRY_INVALID_ROT_RECORD','REGISTRY_IP_FAILURES_CORRUPT',
+        'CROSS_ORIGIN_REQUEST','METHOD_NOT_ALLOWED','REQUEST_TOO_LARGE','INVALID_JSON'
+    ];
+    $error=in_array($decoded['error'],$allowed,true)?$decoded['error']:'UNKNOWN_ERROR_CODE';
+    if ($httpCode===429 && $error==='REGISTRATION_LIMIT' && isset($decoded['reason']) && is_string($decoded['reason'])) {
+        $limitReasons=['ROT_ID_IP_CONFLICT','CAPACITY_REACHED','IP_LIMIT_REACHED'];
+        if (in_array($decoded['reason'],$limitReasons,true)) {$error.='_'.$decoded['reason'];}
+    }
+    return $reason.'_'.$error;
+}
+
+function registrationResponseFailure(array $record,$decoded) {
+    global $rotId,$rotNickname,$tikker;
+
+    if (!is_array($decoded)) {return 'REGISTER_201_INVALID_JSON';}
+    $required=[
+        'ok'=>'OK','protocol'=>'PROTOCOL','proxyId'=>'PROXY_ID','rotId'=>'ROT_ID',
+        'nickname'=>'NICKNAME','coin'=>'COIN','status'=>'STATUS','authToken'=>'AUTH_TOKEN',
+        'expiresIn'=>'EXPIRES_IN','timestampTolerance'=>'TIMESTAMP_TOLERANCE'
+    ];
+    foreach ($required as $field=>$label) {
+        if (!isset($decoded[$field])) {return 'REGISTER_201_MISSING_'.$label;}
+    }
+    if ($decoded['ok']!==true) {return 'REGISTER_201_INVALID_OK';}
+    if ($decoded['protocol']!==1) {return 'REGISTER_201_INVALID_PROTOCOL';}
+    if (!is_string($decoded['proxyId']) || !hash_equals($record['proxyId'],$decoded['proxyId'])) {return 'REGISTER_201_INVALID_PROXY_ID';}
+    if (!is_string($decoded['rotId']) || !hash_equals($rotId,$decoded['rotId'])) {return 'REGISTER_201_INVALID_ROT_ID';}
+    if (!is_string($decoded['nickname']) || !hash_equals($rotNickname,$decoded['nickname'])) {return 'REGISTER_201_INVALID_NICKNAME';}
+    if ($decoded['coin']!==$tikker) {return 'REGISTER_201_INVALID_COIN';}
+    if ($decoded['status']!=='CANDIDATE') {return 'REGISTER_201_INVALID_STATUS';}
+    if (!is_string($decoded['authToken']) || !preg_match('/^[0-9a-f]{64}$/',$decoded['authToken'])) {return 'REGISTER_201_INVALID_AUTH_TOKEN';}
+    if (!is_int($decoded['expiresIn']) || $decoded['expiresIn']<1) {return 'REGISTER_201_INVALID_EXPIRES_IN';}
+    if (!is_int($decoded['timestampTolerance']) || $decoded['timestampTolerance']<30 || $decoded['timestampTolerance']>600) {return 'REGISTER_201_INVALID_TIMESTAMP_TOLERANCE';}
+    return '';
+}
+
 function handleRegisterResponse(array $meta,$httpCode,$raw) {
     global $registrationManager,$rotId,$rotNickname,$tikker;
 
     if (!isset($meta['proxyId'],$registrationManager['state']['proxies'][$meta['proxyId']])) {return;}
     $record=&$registrationManager['state']['proxies'][$meta['proxyId']];
+    if ($httpCode!==201) {
+        failRegistrationJob($meta,registrationHttpFailure($httpCode,$raw));
+        return;
+    }
     $decoded=json_decode($raw,true);
-    if ($httpCode!==201 || !is_array($decoded) || !isset($decoded['ok'],$decoded['protocol'],$decoded['proxyId'],$decoded['rotId'],$decoded['nickname'],$decoded['coin'],$decoded['status'],$decoded['authToken'],$decoded['expiresIn'],$decoded['timestampTolerance']) || $decoded['ok']!==true || $decoded['protocol']!==1 || !hash_equals($record['proxyId'],$decoded['proxyId']) || !hash_equals($rotId,$decoded['rotId']) || !hash_equals($rotNickname,$decoded['nickname']) || $decoded['coin']!==$tikker || $decoded['status']!=='CANDIDATE' || !is_string($decoded['authToken']) || !preg_match('/^[0-9a-f]{64}$/',$decoded['authToken']) || !is_int($decoded['expiresIn']) || $decoded['expiresIn']<1 || !is_int($decoded['timestampTolerance']) || $decoded['timestampTolerance']<30 || $decoded['timestampTolerance']>600) {
-        failRegistrationJob($meta,'INVALID_REGISTER_RESPONSE');
+    $failure=registrationResponseFailure($record,$decoded);
+    if ($failure!=='') {
+        failRegistrationJob($meta,$failure);
         return;
     }
     $record['authToken']=$decoded['authToken'];
@@ -997,6 +1105,7 @@ function startProxyRegistration(array $record) {
         'coin'=>$tikker,
         'rotId'=>$rotId,
         'nickname'=>$rotNickname,
+        'rotVersion'=>VERSION,
         'port'=>(int)SOCKET
     ],['proxyId'=>$record['proxyId']]);
 }
@@ -1173,15 +1282,15 @@ function computeBlockHash(string $header80): string {
 /**
  * extractBlocksFromStream serves two purposes.
  * At first it races to the 'end' of the blockchain by parsing all blocks in blk*.dat
- * Blocks are returned one by one, completely parsed, to build the main indexes during a '$raceToTheTop' 
+ * Blocks are returned one by one, completely parsed, to build the main indexes during a '$raceToTheTop'
  *
  * Once at the top it starts handling and prioritizing client requests
  * If all client-requests are handled it tails the blk*.dat stream.
  *
  */
 function extractBlocksFromStream(): Generator {
-    global $RPC,$BLOCKINDEX,$raceToTheTop,$orphan,$blkvalid,$parseContext,$fullBackup,$height,$blockFiles,$tikker;
-    
+    global $RPC,$BLOCKINDEX,$raceToTheTop,$orphan,$blkvalid,$parseContext,$fullBackup,$height,$blockFiles,$coinProperties;
+
     $coreFailure=false;
     $pollDelayMicro = 500000; // 0.1s; Poll delay when waiting for new data
     $tipReached=false;
@@ -1200,7 +1309,7 @@ function extractBlocksFromStream(): Generator {
         }
     }
     if ($fileNumber==-1){L("Strange 'currentFile' {$currentFile} in parsecontext\n");die();}
-    
+
     $handle = fopen($currentFile, 'rb');
     $last_error="";$repeat_error=0;
     while (true) {                            // 'yields' after every block encountered
@@ -1220,19 +1329,19 @@ function extractBlocksFromStream(): Generator {
                         L("End of disk blockstream reached at height ".($height-1)."; Turn to RPC; Waiting for next block and client requests... \n");
                         continue; // turn to RPC
                     }
-                    throw new \Exception("Invalid magic bytes at offset $offset in file $currentFile: " . bin2hex($magic));
-                }            
+                    throw new \Exception("Invalid magic bytes at offset {$parseContext['offset']} in file $currentFile: " . bin2hex($magic));
+                }
 
                 $blockData = fread($handle, $blockLength); // Attempt to read the full block
                 if (strlen($blockData) < $blockLength) {
-                    throw new Exception("Incomplete block at offset $offset in file $file");
+                    throw new \Exception("Incomplete block at offset {$parseContext['offset']} in file $currentFile");
                 }
-    
+
                 $header        = substr($blockData, 0, 80);
                 $blockHash     = computeBlockHash($header);
                 $prevBlockHash = bin2hex(strrev(substr($header, 4, 32)));
                 $newHeight     = $BLOCKINDEX->hashMap[$blockHash] ?? null;
-                if ($newHeight==0) {continue;} // skip genesis block                
+                if ($newHeight==0) {continue;} // skip genesis block
                 if (is_null($newHeight)) {
                     $offset += 8 + $blockLength;
                     $orphan++;
@@ -1241,29 +1350,37 @@ function extractBlocksFromStream(): Generator {
                 $blkvalid++;
             } else { // Turn to RPC
                 while (true) {
-                    $blockHash     = $RPC->call('getblockhash',[$height]);
+                    $blockHash     = $RPC->call('getblockhash',[$height], 'chain-tip-hash');
                     if ($blockHash<0) {
                         break;
-                    } elseif ($blockHash!==null) {break;}   // new block                     
+                    } elseif ($blockHash!==null) {break;}   // new block
                 }
                 if ($blockHash<0) {break;} // no block yet
                 while (true){
-                    $rawHex        = $RPC->call('getblock',[$blockHash, false]);
-                    if ($rawHex!==null) {break;}
+                    $rpcBlock=$RPC->call('getblock',[$blockHash,$coinProperties['rpcBlockVerbosity']], 'chain-tip-block');
+                    if ($rpcBlock!==null) {break;}
                 }
                 $newHeight     = $height;
-                if ($tikker=="DEM") {
-                    $blockData     = $rawHex;
-                    $prevBlockHash = $rawHex['previousblockhash'];
+                if ($coinProperties['rpcBlockRepresentation']==='decoded') {
+                    if (!is_array($rpcBlock) || !isset($rpcBlock['previousblockhash'],$rpcBlock['tx']) || !is_string($rpcBlock['previousblockhash']) || !preg_match('/^[0-9a-f]{64}$/',$rpcBlock['previousblockhash']) || !is_array($rpcBlock['tx'])) {
+                        throw new \UnexpectedValueException("Invalid decoded RPC block at height $height");
+                    }
+                    $blockData     = $rpcBlock;
+                    $blockLength   = 0;
+                    $prevBlockHash = $rpcBlock['previousblockhash'];
                 } else {
-                    $blockData     = hex2bin($rawHex);
+                    if (!is_string($rpcBlock) || strlen($rpcBlock)<160 || (strlen($rpcBlock)%2)!==0 || !ctype_xdigit($rpcBlock)) {
+                        throw new \UnexpectedValueException("Invalid raw RPC block at height $height");
+                    }
+                    $blockData     = hex2bin($rpcBlock);
+                    if ($blockData===false) {throw new \UnexpectedValueException("Invalid raw RPC block at height $height");}
                     $blockLength   = strlen($blockData);
                     $prevBlockHash = bin2hex(strrev(substr($blockData, 4, 32)));
                 }
                 if (!$tipReached) {
                     if ($height>=$top) {
                         while(true) {
-                            $top=$RPC->call('getblockcount',[]);                                
+                            $top=$RPC->call('getblockcount',[], 'chain-tip-height');
                             if ($top!==null) {break;}
                         }
                         if ($height-1==$top) {$tipReached=true;} // height is the next block we are waiting for
@@ -1301,11 +1418,11 @@ function extractBlocksFromStream(): Generator {
         } else {
             $raceToTheTop=false;
         }
-        
+
         // No news from blockchain;
         $serviceTime=microtime(true);
         handleSocketRequests($serviceTime+1); // may take longer, but try to return
-        
+
         $requests=glob(Q."/*");
         foreach($requests as $request){
             $destination=str_replace(Q,A,$request);
@@ -1315,14 +1432,14 @@ function extractBlocksFromStream(): Generator {
             echo $response."\n";
             break;
         }
-        
+
     }
 }
 function stripResources(array $table){ // to allow serialization
-    // 
+    //
     $filtered = [];
     foreach ($table as $ksub => $sub) {
-        if (is_array($sub)) {   
+        if (is_array($sub)) {
             foreach ($sub as $k => $v) {
                 if (!(($k==P)||($k==KEY))) {
                     $filtered[$ksub][$k] = $v;
@@ -1395,7 +1512,7 @@ function loadBackupCandidate($postfix,$full=false) {
 function backupIsCanonical(array $candidate) {
     global $RPC;
     while (true) {
-        $hash=$RPC->call('getblockhash',[$candidate['context']['height']]);
+        $hash=$RPC->call('getblockhash',[$candidate['context']['height']], 'backup-checkpoint');
         if ($hash!==null) {break;}
     }
     return is_string($hash) && hash_equals($candidate['context']['hash'],$hash);
@@ -1859,7 +1976,7 @@ function handleSendRequest($id,$rawHex) {
         return sendResponse($id,false,'REJECTED',null,['error'=>'INVALID_RAW_TRANSACTION','rotMs'=>(int)round((microtime(true)-$started)*1000)]);
     }
 
-    $core=$RPC->callResult('sendrawtransaction',[$rawHex]);
+    $core=$RPC->callResult('sendrawtransaction',[$rawHex],'wallet-broadcast');
     $timing=['coreMs'=>$core['durationMs'],'rotMs'=>(int)round((microtime(true)-$started)*1000)];
     if ($core['technical']) {
         return sendResponse($id,false,'UNAVAILABLE',$localTxid,array_merge($timing,['technical'=>true,'error'=>$core['error']]));
@@ -1905,7 +2022,7 @@ function handleTransactionStatusRequest($id,$txid) {
         ]);
     }
 
-    $core=$RPC->callResult('getrawmempool',[]);
+    $core=$RPC->callResult('getrawmempool',[],'wallet-status');
     $timing=['coreMs'=>$core['durationMs'],'rotMs'=>(int)round((microtime(true)-$started)*1000)];
     if ($core['technical'] || !$core['ok'] || !is_array($core['result'])) {
         return sendResponse($id,false,'UNAVAILABLE',$txid,array_merge($timing,['technical'=>true,'error'=>'CORE_STATUS_UNAVAILABLE']));
@@ -2015,7 +2132,7 @@ function handleZeroConfirmationRequest($id,$parameters) {
         ]);
     }
 
-    $mempool=$RPC->callResult('getrawmempool',[]);
+    $mempool=$RPC->callResult('getrawmempool',[],'wallet-zero-confirmation');
     if ($mempool['technical'] || !$mempool['ok'] || !is_array($mempool['result'])) {
         return sendResponse($id,false,'UNAVAILABLE',$txid,['technical'=>true,'address'=>$address,'amountSats'=>$amountSats,'error'=>'CORE_MEMPOOL_UNAVAILABLE','coreMs'=>$mempool['durationMs'],'rotMs'=>(int)round((microtime(true)-$started)*1000)]);
     }
@@ -2023,7 +2140,7 @@ function handleZeroConfirmationRequest($id,$parameters) {
         return sendResponse($id,true,'NOT_SEEN',$txid,['address'=>$address,'amountSats'=>$amountSats,'confirmed'=>false,'coreMs'=>$mempool['durationMs'],'rotMs'=>(int)round((microtime(true)-$started)*1000)]);
     }
 
-    $decoded=$RPC->callResult('getrawtransaction',[$txid,1]);
+    $decoded=$RPC->callResult('getrawtransaction',[$txid,1],'wallet-zero-confirmation');
     $coreMs=$mempool['durationMs']+$decoded['durationMs'];
     if ($decoded['technical'] || !$decoded['ok'] || !is_array($decoded['result']) || !isset($decoded['result']['txid']) || strtolower((string)$decoded['result']['txid'])!==$txid || !isset($decoded['result']['vout']) || !is_array($decoded['result']['vout'])) {
         return sendResponse($id,false,'UNAVAILABLE',$txid,['technical'=>true,'address'=>$address,'amountSats'=>$amountSats,'error'=>'CORE_TRANSACTION_UNAVAILABLE','coreMs'=>$coreMs,'rotMs'=>(int)round((microtime(true)-$started)*1000)]);
@@ -2397,7 +2514,7 @@ function handleHistoryRequest($id,$params) {
 }
 function handleClientRequest($request) {
     global $height,$TX_table,$TXO_table,$PUB_table,$versionByte,$operatorSecret;
-    
+
     $start=microtime(true);
     $cmd=explode("|",trim($request));
     if (count($cmd)!=3) {  // ID|CMD|params
@@ -2420,7 +2537,7 @@ function handleClientRequest($request) {
         $output.= "TX  size %free records: $txSize $txSpace {$TX_table['bucket'][TOP]}\n";
         $output.="PUB size %free records: $pubSize $pubSpace {$PUB_table['bucket'][TOP]}\n";
         $output.="TXO size %free records: $txoSize $txoSpace {$TXO_table['bucket'][TOP]}\n";
-    } elseif ($a=="blk") {        
+    } elseif ($a=="blk") {
         if (!isValidIntString($b,$height)) {
             $output="$b:$height\n";
         } else {
@@ -2482,9 +2599,9 @@ function handleClientRequest($request) {
         foreach ($rows as $row) {
             $cells = $row->getElementsByTagName('td');
             if ($cells->length >= 5) {
-                $col1 = trim($cells->item(0)->textContent); 
-                $col2 = trim($cells->item(1)->textContent); 
-                $col3 = trim($cells->item(2)->textContent); 
+                $col1 = trim($cells->item(0)->textContent);
+                $col2 = trim($cells->item(1)->textContent);
+                $col3 = trim($cells->item(2)->textContent);
                 $rich[]="$col1 | $col2 | $col3\n";
             }
         }
@@ -2514,11 +2631,11 @@ function handleClientRequest($request) {
                         }
                     }
                     $output.=trim($line)." | {$pubs[$pub]} | $sum\n";
-                } else { 
+                } else {
                     $output.=trim($line)." | ?\n";
                 }
             }
-        }            
+        }
     } elseif ($a=="tx"){
         [$index,$record]=find($TX_table,hex2bin($b));
         if ($index){
@@ -2535,10 +2652,10 @@ function handleClientRequest($request) {
                 $base58=address_from_pubkeyhash($pub[0]);
                 $output.= "n:{$txo[1]} value:{$txo[2]} pub:$base58 spend:{$txo[4]} linked-list:{$txo[5]}\n";
                 $i++;
-                $txo=hashtable_read($TXO_table['bucket'],$record[2]+$i);                    
+                $txo=hashtable_read($TXO_table['bucket'],$record[2]+$i);
             }
         }
-        $output.= "(".(microtime(true)-$start).")\n\n";            
+        $output.= "(".(microtime(true)-$start).")\n\n";
     } elseif ($a=="send"){
         return handleSendRequest($cmd[0],$b);
     } elseif ($a=="txstatus"){
@@ -2575,8 +2692,8 @@ function handleClientRequest($request) {
                     } else {
                         $txo[3]=0;
                     }
-                }                    
-                $output.= "\ntxo total:$n";                            
+                }
+                $output.= "\ntxo total:$n";
                 $output.= "\nbalance:$sum\n";
             }
         }
@@ -2613,7 +2730,7 @@ function handleClientRequest($request) {
                     } else {
                         $txo[3]=0;
                     }
-                }                    
+                }
                 $output.= "\ntxo total:$n spend:$n_out rest:$n_in";
                 $output.= "\nInput:$sum spend:$sum_out rest:$sum_in\n";
             }
@@ -2661,7 +2778,7 @@ function handleClientRequest($request) {
     if ($output=="") {
         return "?$request\n";
     }else{
-        return $output;        
+        return $output;
     }
 }
 function findBlok($block) {
@@ -2699,7 +2816,7 @@ echo "$i:{$record[1]}";
                 $direction=-1;
                 if ($step>1) {$step--;}
             }
-        } 
+        }
         $last=$record[1];
         if ($iterations>200) {break;}
     }
@@ -2729,7 +2846,7 @@ class BlockIndex { /* loads all blockhashes through RPC;
     public $backupHeight;
     public $tip;
     private $batchSize=500;
-    
+
     public function __construct() {
         L("Test if blockchain is synced...");
         try {
@@ -2738,7 +2855,7 @@ class BlockIndex { /* loads all blockhashes through RPC;
         } catch (\GuzzleHttp\Exception\ConnectException $e) {
             L("\nCannot reach core: ".now()." ". $e->getMessage()."\n");
             die();
-        }        
+        }
         $start=0;
         if (file_exists(DATA."blockhashes")){
             $blockhashes=explode("\n",file_get_contents(DATA."blockhashes"));
@@ -2771,7 +2888,7 @@ class BlockIndex { /* loads all blockhashes through RPC;
             $i=0;
             foreach ($results as $id => $result) {
                 if ($result instanceof \Exception) {
-                    L(" .".($height+$i)."\n");    
+                    L(" .".($height+$i)."\n");
                     return $fetched; // likely done
                 }
                 $fetched .= $result . "\n";
@@ -2784,21 +2901,21 @@ class BlockIndex { /* loads all blockhashes through RPC;
         L(" $height\n");
         return $fetched;
     }
-    private function awaitSync(): void {        
+    private function awaitSync(): void {
         global $RPC;
         $blockTip=[];
         $once=true;
         while (true) {
-            $tipHash   = $RPC->call('getbestblockhash', []);
+            $tipHash   = $RPC->call('getbestblockhash', [], 'sync-tip-hash');
             if ($tipHash!==null) {break;}
         }
         while (true) {
             while (true) {
-                $tipHash   = $RPC->call('getbestblockhash', []);
+                $tipHash   = $RPC->call('getbestblockhash', [], 'sync-tip-hash');
                 if ($tipHash!==null) {break;}
             }
             while (true) {
-                $blockTip = $RPC->call('getblock', [$tipHash]);
+                $blockTip = $RPC->call('getblock', [$tipHash], 'sync-tip-block');
                 if ($blockTip!==null) {break;}
             }
             $lag       = time() - $blockTip['time'];
@@ -2808,25 +2925,130 @@ class BlockIndex { /* loads all blockhashes through RPC;
     }
 }
 
+function blockCanonicality($expectedBlockHash) {
+    global $height,$RPC;
+
+    if (!is_string($expectedBlockHash) || !preg_match('/^[0-9a-fA-F]{64}$/',$expectedBlockHash)) {
+        throw new \UnexpectedValueException("Invalid expected block hash at height $height");
+    }
+    $response=$RPC->callResult('getblockhash',[$height],'block-index-canonicality',false,BLOCK_RPC_TIMEOUT);
+    if ($response['technical']) {
+        return ['known'=>false,'canonical'=>false,'currentHash'=>''];
+    }
+    if (!$response['ok']) {
+        $rpcCode=isset($response['rpcCode'])?(int)$response['rpcCode']:0;
+        if (in_array($rpcCode,[-8,-1],true)) {
+            return ['known'=>true,'canonical'=>false,'currentHash'=>''];
+        }
+        throw new \UnexpectedValueException("Core rejected block canonicality check at height $height, RPC $rpcCode");
+    }
+    $currentHash=isset($response['result'])?strtolower((string)$response['result']):'';
+    if (!preg_match('/^[0-9a-f]{64}$/',$currentHash)) {
+        throw new \UnexpectedValueException("Invalid canonical block hash at height $height");
+    }
+    return ['known'=>true,'canonical'=>hash_equals(strtolower($expectedBlockHash),$currentHash),'currentHash'=>$currentHash];
+}
+
+class StaleBlockException extends \RuntimeException {}
+
 class BlockParser { /* Unravels a binary block */
-    public function getBlock($buffer): array {
+    private function waitForRpcRetry($seconds): void {
+        $deadline=microtime(true)+max(1,(int)$seconds);
+        do {
+            registrationTick();
+            usleep(100000);
+        } while (microtime(true)<$deadline);
+        registrationTick();
+    }
+    private function requireCanonicalBlock($expectedBlockHash,$txid=''): void {
+        global $height,$tikker;
+
+        $status=blockCanonicality($expectedBlockHash);
+        if (!$status['known'] || $status['canonical']) {return;}
+        $currentHash=$status['currentHash']===''?'unavailable':$status['currentHash'];
+        $transaction=$txid===''?'':' txid='.$txid;
+        rpcLog("Block reorganisation detected: source=block-index coin=$tikker height=$height expectedHash=$expectedBlockHash currentHash=$currentHash$transaction");
+        throw new StaleBlockException("Decoded block is no longer canonical at height $height");
+    }
+    private function fetchDecodedTransaction($txid,$expectedBlockHash): string {
+        global $height,$RPC,$tikker;
+
+        $failures=0;
+        $recoveryStarted=microtime(true);
+        while (true) {
+            $response=$RPC->callResult('getrawtransaction',[$txid,0],'block-index',false,BLOCK_RPC_TIMEOUT);
+            if (!$response['technical'] && !$response['ok']) {
+                $rpcCode=isset($response['rpcCode'])?(int)$response['rpcCode']:0;
+                $rpcMessage=isset($response['rpcMessage'])?preg_replace('/[\r\n]+/',' ',(string)$response['rpcMessage']):'Core rejected the transaction request';
+                if ($rpcCode!==-5) {
+                    throw new \UnexpectedValueException("Core rejected raw transaction at height $height, txid $txid, RPC $rpcCode: $rpcMessage");
+                }
+                $this->requireCanonicalBlock($expectedBlockHash,$txid);
+                $response['technical']=true;
+                $response['error']='CORE_TRANSACTION_NOT_INDEXED';
+                $response['detail']=$rpcMessage;
+            }
+            if (!$response['technical']) {
+                $txHex=isset($response['result'])?$response['result']:null;
+                if (!is_string($txHex) || strlen($txHex)<2 || (strlen($txHex)%2)!==0 || !ctype_xdigit($txHex)) {
+                    throw new \UnexpectedValueException("Invalid raw transaction at height $height, txid $txid");
+                }
+                if ($failures>0) {
+                    $elapsedMs=(int)round((microtime(true)-$recoveryStarted)*1000);
+                    rpcLog("Core RPC recovered: source=block-index coin=$tikker method=getrawtransaction height=$height txid=$txid failures=$failures elapsedMs=$elapsedMs durationMs={$response['durationMs']}");
+                }
+                return $txHex;
+            }
+
+            $failures++;
+            $error=isset($response['error'])?(string)$response['error']:'CORE_RPC_UNAVAILABLE';
+            if (!in_array($error,['CORE_RPC_TIMEOUT','CORE_RPC_UNAVAILABLE','CORE_NOT_READY','CORE_HTTP_ERROR','CORE_TRANSACTION_NOT_INDEXED'],true)) {
+                throw new \UnexpectedValueException("Technical Core RPC failure at height $height, txid $txid: $error");
+            }
+            $curlCode=isset($response['curlCode'])?(int)$response['curlCode']:0;
+            $rpcCode=isset($response['rpcCode'])?(int)$response['rpcCode']:0;
+            $durationMs=isset($response['durationMs'])?(int)$response['durationMs']:0;
+            $detail=isset($response['detail'])?preg_replace('/[\r\n]+/',' ',(string)$response['detail']):'';
+            if ($failures<=3 || ($failures%10)===0) {
+                rpcLog("Core RPC retry: source=block-index coin=$tikker method=getrawtransaction height=$height txid=$txid failure=$failures error=$error rpcCode=$rpcCode curlCode=$curlCode durationMs=$durationMs detail=$detail");
+            }
+            $elapsedMs=(int)round((microtime(true)-$recoveryStarted)*1000);
+            $remaining=(int)floor(BLOCK_RPC_RECOVERY_LIMIT-(microtime(true)-$recoveryStarted));
+            $wait=min(5,$failures,max(0,$remaining-BLOCK_RPC_TIMEOUT));
+            if ($wait<1) {
+                rpcLog("Core RPC recovery exhausted: source=block-index coin=$tikker method=getrawtransaction height=$height txid=$txid failures=$failures elapsedMs=$elapsedMs lastError=$error rpcCode=$rpcCode curlCode=$curlCode detail=$detail");
+                throw new \UnexpectedValueException("Core RPC recovery exhausted at height $height, txid $txid after $elapsedMs ms");
+            }
+            $this->waitForRpcRetry($wait);
+        }
+    }
+    public function getBlock($buffer,$expectedBlockHash=''): array {
         global $height,$RPC;
-        $skipped=0;        
+        $skipped=0;
         $transactions = [];
         if (is_array ($buffer)) { // decoded json
+            if (!is_string($expectedBlockHash) || !preg_match('/^[0-9a-fA-F]{64}$/',$expectedBlockHash)) {
+                throw new \UnexpectedValueException("Missing decoded block hash at height $height");
+            }
             $txCount=count($buffer['tx']);
             for ($i = 0; $i < $txCount; $i++) {
                 $txid=$buffer['tx'][$i];
-                $txBin=hex2bin($RPC->call('getrawtransaction', [$txid, 0]));
+                if (!is_string($txid) || !preg_match('/^[0-9a-fA-F]{64}$/',$txid)) {throw new \UnexpectedValueException("Invalid transaction id at height $height");}
+                $txid=strtolower($txid);
+                $txHex=$this->fetchDecodedTransaction($txid,$expectedBlockHash);
+                $txBin=hex2bin($txHex);
+                if ($txBin===false) {throw new \UnexpectedValueException("Invalid raw transaction at height $height, txid $txid");}
                 $offset=0;
-                $tx = $this->parseTransactionLite($txBin, $offset);                
+                $tx = $this->parseTransactionLite($txBin, $offset);
                 if ($tx['is_relevant']) {$transactions[] = $tx;} else {$skipped++;}
                 $offset += $tx['length'];
             }
+            $this->requireCanonicalBlock($expectedBlockHash);
         } else {
+            $this->requireBytes($buffer,0,80,'block header');
             $offset = 0;
             $version = unpack("V", substr($buffer, $offset, 4))[1];
-            $offset += 4;    
+            $offset += 4;
             $prevBlock = strrev(substr($buffer, $offset, 32));
             $offset += 32;
             $merkleRoot = strrev(substr($buffer, $offset, 32));
@@ -2847,10 +3069,10 @@ class BlockParser { /* Unravels a binary block */
             ];
             $offset = 80; // Skip block header just for clarity
             if ($version & (1 << 8)) {$this->skipAuxPowHeader($buffer, $offset);}
-            
+
             $txCountSize = 0;
             $txCount = $this->parseVarInt($buffer, $offset, $txCountSize);
-            $offset += $txCountSize;    
+            $offset += $txCountSize;
             for ($i = 0; $i < $txCount; $i++) {
                 $tx = $this->parseTransactionLite($buffer, $offset);
                 $tx['original']=$i; // to track skipped transactions; not used currently
@@ -2866,30 +3088,31 @@ class BlockParser { /* Unravels a binary block */
         ];
     }
     private function parseTransactionLite(string $buffer, int $offset): array {
-        global $height,$tikker;
+        global $height,$coinProperties;
         /* Ring-of-trust-only parser
            Marks a transaction as relevant when it must be indexed; skips coinbase and tx that don't have P2PKH outputs
         */
         $startOffset = $offset;
-    
+
         // 1. Version (4 bytes)
+        $this->requireBytes($buffer,$offset,4+$coinProperties['transactionTimeBytes'],'transaction header');
         $version = substr($buffer, $offset, 4);
-        $offset += 4;
-        
-        if ($tikker=="DEM") {$offset += 4;} //nTime
-    
+        $offset += 4+$coinProperties['transactionTimeBytes'];
+
         // 2. Detect SegWit Marker/Flag (peek)
+        $this->requireBytes($buffer,$offset,1,'transaction input marker');
         $marker = ord($buffer[$offset] ?? "\x00");
         $flag   = ord($buffer[$offset + 1] ?? "\x00");
-    
+
         $hasSegWitMarker = ($marker === 0x00);
         $hasSegWitFlag   = ($flag & 0x01) !== 0;  // ignore MWEB 0x08
         $isSegWit        = false;
         if ($hasSegWitMarker) {
+            $this->requireBytes($buffer,$offset,2,'SegWit marker and flag');
             $offset += 2; // Always skip marker/flag if marker is 0x00
             $isSegWit = $hasSegWitFlag;
         }
-    
+
         // 3. Parse inputs (vin)
         $vinCountOffset = $offset;
         $vinCountLen = 0;
@@ -2901,10 +3124,10 @@ class BlockParser { /* Unravels a binary block */
             if ($offset>strlen($buffer)){
                 die ("break at $height\n");
             }
-            
+
             $inputs[]=$this->parseInput($buffer, $offset);
         }
-    
+
         // 4. Coinbase
         $isCoinbase = (
             $vinCount === 1 &&
@@ -2914,7 +3137,7 @@ class BlockParser { /* Unravels a binary block */
         // 5. Parse outputs (vout)
         $voutCountLen = 0;
         $voutCount = $this->parseVarInt($buffer, $offset, $voutCountLen);
-        $voutStart=$offset;    
+        $voutStart=$offset;
         $offset += $voutCountLen;
         $outputs=[];
         for ($i = 0; $i < $voutCount; $i++) {
@@ -2922,23 +3145,25 @@ class BlockParser { /* Unravels a binary block */
             if ($output[1]!=false) {$outputs[]=[$i,$output[0],$output[1]];} // n,value (P),hash; you could trace OP_RETURNS here using n=-1 and output[0]
         }
         $outputsEnd = $offset;
-        
+
         // 6. If SegWit, parse witness for each input
         if ($isSegWit) {
             for ($i = 0; $i < $vinCount; $i++) {
                 $this->parseWitness($buffer, $offset);
             }
         }
-        
+
         // x. MWEB ignore (would be at least one byte)
-        
+
         // 7. Locktime (4 bytes)
+        $this->requireBytes($buffer,$offset,4,'transaction locktime');
         $locktime = substr($buffer, $offset, 4);
         $offset += 4;
-        
+
         // 8. Other stuff
-        if ($tikker=="DEM"){
+        if ($coinProperties['transactionComment']){
             $commentLength = $this->readVarInt($buffer, $offset);
+            $this->requireBytes($buffer,$offset,$commentLength,'transaction comment');
             $offset += $commentLength;
         }
 
@@ -2954,7 +3179,7 @@ class BlockParser { /* Unravels a binary block */
                 $inputsLen = $voutStart - $vinStart;
                 $locktimeLen = 4;
                 $txBytes =
-                    substr($buffer, $startOffset, 4) . // version
+                    substr($buffer, $startOffset, 4+$coinProperties['transactionTimeBytes']) . // version and optional nTime
                     substr($buffer, $vinCountOffset, $outputsEnd - $vinCountOffset) . // vinCount + inputs + voutCount + outputs
                     $locktime;
             } else {
@@ -2977,107 +3202,139 @@ class BlockParser { /* Unravels a binary block */
     private function skipAuxPowHeader(string $buffer, int &$offset) {
         // 1. Skip embedded coinbase tx (AuxPoW coinbasetx)
         $this->skipTransaction($buffer, $offset);
-        
+
+        $this->requireBytes($buffer,$offset,32,'AuxPoW parent block hash');
         $offset += 32;  // parent block hash?????
-        
+
         $coinbaseBranchCount = $this->readVarInt($buffer, $offset);
+        $this->requireBytes($buffer,$offset,32*$coinbaseBranchCount,'AuxPoW coinbase branch');
         $offset += 32 * $coinbaseBranchCount;
-    
+
+        $this->requireBytes($buffer,$offset,4,'AuxPoW coinbase index');
         $coinbaseIndex = substr($buffer, $offset, 4);
         $offset += 4;
-    
+
         // 4. Now at chainMerkleBranch
         $chainBranchCount = $this->readVarInt($buffer, $offset);
+        $this->requireBytes($buffer,$offset,32*$chainBranchCount,'AuxPoW chain branch');
         $offset += 32 * $chainBranchCount;
-    
+
         // 5. chainIndex (4 bytes)
+        $this->requireBytes($buffer,$offset,4,'AuxPoW chain index');
         $offset += 4;
-    
+
         // 6. parent block header (80 bytes)
+        $this->requireBytes($buffer,$offset,80,'AuxPoW parent block header');
         $offset += 80;
-    }    
+    }
     private function skipTransaction(string $buffer, int &$offset): void {
         // 1. version (4 bytes)
+        $this->requireBytes($buffer,$offset,4,'AuxPoW coinbase version');
         $offset += 4;
-    
+
         // 2. inputs (vin)
         $vinCount = $this->readVarInt($buffer, $offset);
         for ($i = 0; $i < $vinCount; $i++) {
+            $this->requireBytes($buffer,$offset,36,'AuxPoW coinbase input outpoint');
             $offset += 32; // prev txid
             $offset += 4;  // prev vout index
-    
+
             $scriptLen = $this->readVarInt($buffer, $offset);
+            $this->requireBytes($buffer,$offset,$scriptLen,'AuxPoW coinbase input script');
             $offset += $scriptLen; // scriptSig
-    
+
+            $this->requireBytes($buffer,$offset,4,'AuxPoW coinbase input sequence');
             $offset += 4; // sequence
         }
-    
+
         // 3. outputs (vout)
         $voutCount = $this->readVarInt($buffer, $offset);
         for ($i = 0; $i < $voutCount; $i++) {
+            $this->requireBytes($buffer,$offset,8,'AuxPoW coinbase output value');
             $offset += 8; // value
-    
+
             $scriptLen = $this->readVarInt($buffer, $offset);
+            $this->requireBytes($buffer,$offset,$scriptLen,'AuxPoW coinbase output script');
             $offset += $scriptLen; // scriptPubKey
         }
-    
+
         // 4. locktime (4 bytes)
+        $this->requireBytes($buffer,$offset,4,'AuxPoW coinbase locktime');
         $offset += 4;
-    }    
+    }
+    private function requireBytes(string $buffer,int $offset,int $length,string $context): void {
+        global $height;
+        $bufferLength=strlen($buffer);
+        if ($offset<0 || $length<0 || $length>$bufferLength || $offset>$bufferLength-$length) {
+            throw new \UnexpectedValueException("Truncated $context at height $height: offset $offset, need $length byte(s), buffer length $bufferLength");
+        }
+    }
     private function parseVarInt(string $buffer, int $offset, &$size): int {
-        global $height,$parseContext;
+        $this->requireBytes($buffer,$offset,1,'varint prefix');
         $first = ord($buffer[$offset]);
         if ($first < 0xfd) {
             $size = 1;
             return $first;
         } elseif ($first === 0xfd) {
             $size = 3;
+            $this->requireBytes($buffer,$offset,$size,'uint16 varint');
             return unpack("v", substr($buffer, $offset + 1, 2))[1];
         } elseif ($first === 0xfe) {
             $size = 5;
+            $this->requireBytes($buffer,$offset,$size,'uint32 varint');
             return unpack("V", substr($buffer, $offset + 1, 4))[1];
         } else {
             $size = 9;
+            $this->requireBytes($buffer,$offset,$size,'uint64 varint');
             return unpack("P", substr($buffer, $offset + 1, 8))[1];
         }
     }
     function readVarInt($buffer, &$offset) {
+        $this->requireBytes($buffer,$offset,1,'varint prefix');
         $first = ord($buffer[$offset++]);
         if ($first < 0xfd) return $first;
         if ($first === 0xfd) {
+            $this->requireBytes($buffer,$offset,2,'uint16 varint');
             $val = unpack("v", substr($buffer, $offset, 2))[1];
             $offset += 2;
             return $val;
         }
         if ($first === 0xfe) {
+            $this->requireBytes($buffer,$offset,4,'uint32 varint');
             $val = unpack("V", substr($buffer, $offset, 4))[1];
             $offset += 4;
             return $val;
         }
+        $this->requireBytes($buffer,$offset,8,'uint64 varint');
         $val = unpack("P", substr($buffer, $offset, 8))[1]; // Little-endian 64-bit
         $offset += 8;
         return $val;
     }
     private function parseVarBytes($buffer, &$offset) {
         $len = $this->readVarInt($buffer, $offset);
+        $this->requireBytes($buffer,$offset,$len,'variable-length field');
         $data = substr($buffer, $offset, $len);
         $offset += $len;
         return [$data, $len];
     }
     private function parseInput(string $buffer, int &$offset) {
+        $this->requireBytes($buffer,$offset,36,'transaction input outpoint');
         $prev_tx=substr($buffer,$offset,32);
         $prev_vout=unpack("V",substr($buffer,$offset+32,4))[1];
         $offset += 32 + 4;
         $this->parseScript($buffer, $offset);
+        $this->requireBytes($buffer,$offset,4,'transaction input sequence');
         $offset += 4;
         return ([$prev_tx,$prev_vout]);
     }
     private function parseOutput(string $buffer, int &$offset) {
+        $this->requireBytes($buffer,$offset,8,'transaction output value');
         $value=unpack("P",substr($buffer,$offset,8))[1];
         $offset += 8;
         $scriptLenLen = 0;
         $scriptLen = $this->parseVarInt($buffer, $offset, $scriptLenLen);
         $offset += $scriptLenLen;
+        $this->requireBytes($buffer,$offset,$scriptLen,'transaction output script');
         $script = substr($buffer, $offset, $scriptLen);
         $b0 = ord($script[0] ?? "\x00");
         if (($b0 === 0x76) &&
@@ -3096,25 +3353,30 @@ class BlockParser { /* Unravels a binary block */
     private function parseScript(string $buffer, int &$offset): void {
         $scriptSizeLen = 0;
         $scriptLen = $this->parseVarInt($buffer, $offset, $scriptSizeLen);
-        $offset += $scriptSizeLen + $scriptLen;
+        $offset += $scriptSizeLen;
+        $this->requireBytes($buffer,$offset,$scriptLen,'transaction input script');
+        $offset += $scriptLen;
     }
     private function parseWitness(string $buffer, int &$offset): void {
         $itemCountLen = 0;
         $itemCount = $this->parseVarInt($buffer, $offset, $itemCountLen);
         $offset += $itemCountLen;
-    
+
         for ($i = 0; $i < $itemCount; $i++) {
             $itemLenLen = 0;
             $itemLen = $this->parseVarInt($buffer, $offset, $itemLenLen);
             $offset += $itemLenLen;
+            $this->requireBytes($buffer,$offset,$itemLen,'witness item');
             $offset += $itemLen;
         }
     }
     private function parseOutputSec(string $buffer, int &$offset): void { // parse-only
+        $this->requireBytes($buffer,$offset,8,'transaction output value');
         $offset += 8;
         $scriptLenLen = 0;
         $scriptLen = $this->parseVarInt($buffer, $offset, $scriptLenLen);
         $offset += $scriptLenLen;
+        $this->requireBytes($buffer,$offset,$scriptLen,'transaction output script');
         $offset += $scriptLen;
     }
     private function parseOutputGeneric(string $buffer, int &$offset, array &$scriptPubKeyHashes, array &$opReturnData): void {
@@ -3124,28 +3386,30 @@ class BlockParser { /* Unravels a binary block */
          *  - OP_RETURN              extract OP_RETURN payload into $opReturnData
          *
          */
-        
+
+        $this->requireBytes($buffer,$offset,8,'transaction output value');
         $offset += 8; // 1) Skip value (8 bytes)
-    
+
         // 2) Read script length (varint)
         $scriptLenLen = 0;
         $scriptLen = $this->parseVarInt($buffer, $offset, $scriptLenLen);
         $offset += $scriptLenLen;
-    
+
         // 3) Extract the full scriptPubKey
+        $this->requireBytes($buffer,$offset,$scriptLen,'transaction output script');
         $script = substr($buffer, $offset, $scriptLen);
-    
+
         // 4) Categorize
         $b0 = ord($script[0] ?? "\x00");
         if ($b0 === 0x6a) {
             // OP_RETURN
             $pos = 1;
             $payloads = [];
-    
+
             while ($pos < $scriptLen) {
                 $op = ord($script[$pos]);
                 $pos++;
-    
+
                 if ($op >= 1 && $op <= 75) {
                     // OP_PUSHBYTES_n: next 'n' bytes are payload
                     $n = $op;
@@ -3161,16 +3425,16 @@ class BlockParser { /* Unravels a binary block */
                     // Other OP_* inside OP_RETURN, skip or break
                     break;
                 }
-    
+
                 // slice out the data
                 $data = substr($script, $pos, $n);
                 $payloads[] = bin2hex($data);
                 $pos += $n;
             }
-    
+
             // record the OP_RETURN payload(s)
             $opReturnData[] = $payloads;
-    
+
         } elseif (($b0 === 0x76) &&
             ((ord($script[1] ?? "\x00") === 0xa9) &&
             (ord($script[2] ?? "\x00") === 0x14) &&
@@ -3178,13 +3442,13 @@ class BlockParser { /* Unravels a binary block */
             (ord($script[23] ?? "\x00") === 0x88) &&
             (ord($script[24] ?? "\x00") === 0xac))) {
             $pubKeyHash = substr($script, 3, 20);
-        } else {    
+        } else {
             // non-OP_RETURN: hash160(script)
             $hash160 = hash('ripemd160', hash('sha256', $script, true), true);
             $scriptPubKeyHashes[] = bin2hex($hash160);
-        }    
+        }
         $offset += $scriptLen;
-    } 
+    }
 }
 function base58check_decode($base58) {
     global $alphabet;
@@ -3292,11 +3556,20 @@ class JsonRpcClient {
     private $id = 0;
     private $repeat_error = 0;
     private $last_error   = "";
+    private $errorStartedAt = 0;
+    private $errorMethod = '';
+    private $errorCallsite = '';
+    private $errorFailures = 0;
+    private $errorRpcMs = 0;
+    private $errorBackoffMs = 0;
 
     public function __construct(array $rpc) {
         $this->url = "http://{$rpc['user']}:{$rpc['pass']}@{$rpc['host']}:{$rpc['port']}/";
     }
-    public function call($method, $params = []) {
+    public function call($method, $params = [], $callsite = 'internal') {
+        $started=microtime(true);
+        $callsite=preg_replace('/[^A-Za-z0-9._-]/','',substr((string)$callsite,0,48));
+        if ($callsite==='') {$callsite='internal';}
         $payload = json_encode([
             'method' => $method,
             'params' => $params,
@@ -3313,25 +3586,61 @@ class JsonRpcClient {
         ]);
 
         $response = curl_exec($ch);
-                //    if (strpos($e->getMessage(),'"code":-8')===false) {
-                //    if (strpos($e->getMessage(),'"code":-1')===false) {
+        $httpCode=(int)curl_getinfo($ch,CURLINFO_HTTP_CODE);
+        $durationMs=(int)round((microtime(true)-$started)*1000);
         if ($response === false) {
-            return $this->handleError("CURL error: " . curl_error($ch));
+            $curlCode=(int)curl_errno($ch);
+            $curlError=preg_replace('/[\r\n]+/',' ',substr((string)curl_error($ch),0,256));
+            $error=$curlCode===CURLE_OPERATION_TIMEDOUT?'CORE_RPC_TIMEOUT':'CORE_RPC_UNAVAILABLE';
+            curl_close($ch);
+            return $this->handleError("Core RPC transport failure: source=internal method=$method callsite=$callsite error=$error curlCode=$curlCode durationMs=$durationMs detail=$curlError","transport:$method:$callsite:$error:$curlCode",$method,$callsite,$started,$durationMs);
+        }
+        curl_close($ch);
+        if ($httpCode!==0 && $httpCode!==200 && $httpCode!==500) {
+            return $this->handleError("Core RPC response failure: source=internal method=$method callsite=$callsite error=CORE_HTTP_ERROR httpCode=$httpCode durationMs=$durationMs","http:$method:$callsite:$httpCode",$method,$callsite,$started,$durationMs);
         }
         $decoded = json_decode($response, true);
+        if (!is_array($decoded) || (!array_key_exists('result',$decoded) && !isset($decoded['error']))) {
+            return $this->handleError("Core RPC response failure: source=internal method=$method callsite=$callsite error=INVALID_CORE_RESPONSE httpCode=$httpCode durationMs=$durationMs","response:$method:$callsite",$method,$callsite,$started,$durationMs);
+        }
         if (isset($decoded['error']) && $decoded['error'] !== null) {
             $err = $decoded['error'];
-            if (in_array($err['code'], [-8, -1])) { // Expected "not ready yet"
+            if (!is_array($err) || !isset($err['code']) || !is_int($err['code'])) {
+                return $this->handleError("Core RPC response failure: source=internal method=$method callsite=$callsite error=INVALID_CORE_RESPONSE httpCode=$httpCode durationMs=$durationMs","response:$method:$callsite",$method,$callsite,$started,$durationMs);
+            }
+            if (in_array($err['code'], [-8, -1],true)) { // Expected "not ready yet"
+                $this->finishInternalRecovery($method,$callsite,'expected-error',$durationMs,$err['code']);
                 return $err['code'];
             }
-            return $this->handleError("RPC error: " . json_encode($decoded['error']));
+            return $this->handleError("Core RPC rejection: source=internal method=$method callsite=$callsite rpcCode={$err['code']} durationMs=$durationMs","rejection:$method:$callsite:{$err['code']}",$method,$callsite,$started,$durationMs);
+        }
+        if ($httpCode!==0 && $httpCode!==200) {
+            return $this->handleError("Core RPC response failure: source=internal method=$method callsite=$callsite error=CORE_HTTP_ERROR httpCode=$httpCode durationMs=$durationMs","http:$method:$callsite:$httpCode",$method,$callsite,$started,$durationMs);
+        }
+        $this->finishInternalRecovery($method,$callsite,'result',$durationMs);
+        return $decoded['result'];
+    }
+    private function finishInternalRecovery($method,$callsite,$outcome,$durationMs,$rpcCode=null) {
+        if ($this->last_error!=="") {
+            $elapsedMs=(int)round((microtime(true)-$this->errorStartedAt)*1000);
+            $rpcMs=$this->errorRpcMs+$durationMs;
+            $expected=$rpcCode===null?'':' rpcCode='.$rpcCode;
+            rpcLog("Core RPC recovered: source=internal method=$method callsite=$callsite failedMethod={$this->errorMethod} failedCallsite={$this->errorCallsite} failures={$this->errorFailures} outcome=$outcome$expected elapsedMs=$elapsedMs rpcMs=$rpcMs backoffMs={$this->errorBackoffMs} durationMs=$durationMs");
         }
         $this->repeat_error = 0;
         $this->last_error   = "";
-        return $decoded['result'];
+        $this->errorStartedAt=0;
+        $this->errorMethod='';
+        $this->errorCallsite='';
+        $this->errorFailures=0;
+        $this->errorRpcMs=0;
+        $this->errorBackoffMs=0;
     }
-    public function callResult($method,$params=[]) {
+    public function callResult($method,$params=[],$source='service',$logFailure=true,$timeout=6) {
         $started=microtime(true);
+        $timeout=max(1,min(30,(int)$timeout));
+        $source=preg_replace('/[^A-Za-z0-9._-]/','',substr((string)$source,0,48));
+        if ($source==='') {$source='service';}
         $payload=json_encode([
             'method'=>$method,
             'params'=>$params,
@@ -3347,54 +3656,75 @@ class JsonRpcClient {
             CURLOPT_POST=>true,
             CURLOPT_HTTPHEADER=>['Content-Type: application/json'],
             CURLOPT_POSTFIELDS=>$payload,
-            CURLOPT_CONNECTTIMEOUT=>2,
-            CURLOPT_TIMEOUT=>6
+            CURLOPT_CONNECTTIMEOUT=>min(2,$timeout),
+            CURLOPT_TIMEOUT=>$timeout
         ]);
         $response=curl_exec($ch);
         $httpCode=(int)curl_getinfo($ch,CURLINFO_HTTP_CODE);
         if ($response===false) {
+            $curlCode=(int)curl_errno($ch);
+            $curlError=substr((string)curl_error($ch),0,256);
             curl_close($ch);
-            return ['technical'=>true,'ok'=>false,'error'=>'CORE_RPC_UNAVAILABLE','durationMs'=>(int)round((microtime(true)-$started)*1000)];
+            $error=$curlCode===CURLE_OPERATION_TIMEDOUT?'CORE_RPC_TIMEOUT':'CORE_RPC_UNAVAILABLE';
+            $durationMs=(int)round((microtime(true)-$started)*1000);
+            $logDetail=preg_replace('/[\r\n]+/',' ',$curlError);
+            if ($logFailure) {rpcLog("Core RPC transport failure: source=$source method=$method error=$error curlCode=$curlCode durationMs=$durationMs detail=$logDetail");}
+            return ['technical'=>true,'ok'=>false,'error'=>$error,'curlCode'=>$curlCode,'detail'=>$curlError,'durationMs'=>$durationMs];
         }
         curl_close($ch);
 
         $decoded=json_decode($response,true);
         $durationMs=(int)round((microtime(true)-$started)*1000);
         if (!is_array($decoded) || (!array_key_exists('result',$decoded) && !array_key_exists('error',$decoded))) {
+            if ($logFailure) {rpcLog("Core RPC response failure: source=$source method=$method error=INVALID_CORE_RESPONSE httpCode=$httpCode durationMs=$durationMs");}
             return ['technical'=>true,'ok'=>false,'error'=>'INVALID_CORE_RESPONSE','durationMs'=>$durationMs];
         }
         if ($httpCode!==0 && $httpCode!==200 && $httpCode!==500) {
+            if ($logFailure) {rpcLog("Core RPC response failure: source=$source method=$method error=CORE_HTTP_ERROR httpCode=$httpCode durationMs=$durationMs");}
             return ['technical'=>true,'ok'=>false,'error'=>'CORE_HTTP_ERROR','durationMs'=>$durationMs];
         }
         if (isset($decoded['error']) && $decoded['error']!==null) {
             $rpcCode=isset($decoded['error']['code'])?(int)$decoded['error']['code']:0;
             $rpcMessage=isset($decoded['error']['message'])?(string)$decoded['error']['message']:'Core rejected the request';
             if ($rpcCode===-28) {
+                if ($logFailure) {rpcLog("Core RPC response failure: source=$source method=$method error=CORE_NOT_READY rpcCode=$rpcCode durationMs=$durationMs");}
                 return ['technical'=>true,'ok'=>false,'error'=>'CORE_NOT_READY','durationMs'=>$durationMs];
             }
             return ['technical'=>false,'ok'=>false,'rpcCode'=>$rpcCode,'rpcMessage'=>substr($rpcMessage,0,512),'durationMs'=>$durationMs];
         }
         if ($httpCode!==0 && $httpCode!==200) {
+            if ($logFailure) {rpcLog("Core RPC response failure: source=$source method=$method error=CORE_HTTP_ERROR httpCode=$httpCode durationMs=$durationMs");}
             return ['technical'=>true,'ok'=>false,'error'=>'CORE_HTTP_ERROR','durationMs'=>$durationMs];
         }
         return ['technical'=>false,'ok'=>true,'result'=>$decoded['result'],'durationMs'=>$durationMs];
     }
-    private function handleError($msg) {
-        if ($this->last_error !== $msg) {
-            L("Caught exception: " . $msg);
-            $this->last_error   = $msg;
+    private function handleError($msg,$key=null,$method='',$callsite='',$started=0,$durationMs=0) {
+        $errorKey=$key===null?$msg:$key;
+        if ($this->last_error !== $errorKey) {
+            rpcLog("Caught exception: " . $msg);
+            $this->last_error   = $errorKey;
             $this->repeat_error = 0;
+            $this->errorStartedAt=$started;
+            $this->errorMethod=$method;
+            $this->errorCallsite=$callsite;
+            $this->errorFailures=0;
+            $this->errorRpcMs=0;
+            $this->errorBackoffMs=0;
         } else {
             if ($this->repeat_error < 60) {
                 $this->repeat_error++;
             }
             L(".");
         }
+        $this->errorFailures++;
+        $this->errorRpcMs+=$durationMs;
+        $waitStarted=microtime(true);
         if ($this->repeat_error > 10) {
             sleep($this->repeat_error);
         } else {
             sleep(1);
         }
+        $this->errorBackoffMs+=(int)round((microtime(true)-$waitStarted)*1000);
         return null;
     }
     public function batch(array $calls): array {
@@ -3432,7 +3762,7 @@ class JsonRpcClient {
             'params'  => $params,
         ];
     }
-    
+
     private function sendRequest($payload) {
         $ch = curl_init($this->url);
         curl_setopt_array($ch, [
@@ -3482,7 +3812,7 @@ class JsonRpcClient {
     hashtable_add_PUB():    specific publicKeyHash addition to memory; This is specific because public-keys can appear multiple times in history. Only the first occurence is added.
     flattable_append():     specific tx-output(txo) addition to memory; no hash meeded; direct access through tx or pubkeyhash
     find():                 return bucket-index and array of records based on ID
-    
+
     auxilary functions:
     base58check_decode():               returns version-byte and pubkeyhash if valid base58 and valid checksum
     pubkeyhash_from_base58_address():   returns pubkeyhash or false
@@ -3519,7 +3849,7 @@ function load_index(&$table,$part,$where=""){
     $offset = 0;
     while (!feof($fp)) {
         $chunk = fread($fp, $step);
-        shmop_write($table[$part][P],$chunk,$offset);        
+        shmop_write($table[$part][P],$chunk,$offset);
         $offset += $step;
     }
     fclose($fp);
@@ -3562,7 +3892,7 @@ function hashtable_add_TX(&$table,$record){
     Hash is the wrong word but these id's are unique and random as if it were hashes;
     We take the last four bytes (% modulus x) and therefor collisions occur
     These collisions are linked by using the last record-entry (must be provided as zero).
-   
+
     The index consists of two memory-structures:
     - A fixed size (N) hash-index using four-byte pointers. Each position is calculated as hash modulus N
         The pointer points to a linked list of hashes where hash modulus N collides
@@ -3574,13 +3904,13 @@ function hashtable_add_TX(&$table,$record){
         - The last four bytes of the hash to make hash collisions rare
         - A link-pointer to link hashes where (modulus N) collides (0==last item)
     The last link-pointer == 0 so apply (value-1) to obtain the index of the next record
-      
+
     The (hash)index is accompanied by a $table structure to maintain the data:
     $table['hash']          // The (hash)index [memorypointer, size, top]; P=0,SIZE=1,TOP=2
-    $table['bucket']        // The bucket [memorypointer, size, top] 
+    $table['bucket']        // The bucket [memorypointer, size, top]
     $table['increment']         // To reduce memory reallocation; Increments size when top reaches size (except for $table['hash'])
-    
-    verify: SIZE is in bytes, but TOP is an index starting at 1, just like the pointers in the three tables; 
+
+    verify: SIZE is in bytes, but TOP is an index starting at 1, just like the pointers in the three tables;
 */
     global $P;
     static $link_max;
@@ -3603,7 +3933,7 @@ function hashtable_add_TX(&$table,$record){
     // The last four TX-bytes are considered a hash as they are random; these (% 'hash_top') determine the index in the hash-table
     // The first four TX-bytes identify the hash (collisions can still occur)
     hashtable_write($table['bucket'],$bucket_index,$record);
-  
+
     // Calculate start of linked_list;
     // Find end of linked list and point to previous end
     [$fragment]=array_values(unpack("V",substr($ID,-4)));
@@ -3655,7 +3985,7 @@ function hashtable_add_PUB(&$table,$record){
     if ($linked_list==0){ // No linked-list yet; start=0 in bucket; update the hash_table
         hashtable_write($table['hash'],$hash_index,[$bucket_index]);
     } else {
-        $i=0; 
+        $i=0;
         do {
             $i++;
             $content=hashtable_read($table['bucket'],$linked_list);
@@ -3666,14 +3996,14 @@ function hashtable_add_PUB(&$table,$record){
                 hashtable_write($table['bucket'],$linked_list,$content);
                 $table['bucket'][TOP]--;
                 return ([$linked_list,$previous_last_txo]); //<--- exit
-            } 
+            }
             $next = $content[array_key_last($content)];
             if ($next==0){
                 $content[array_key_last($content)]=$bucket_index;
                 hashtable_write($table['bucket'],$linked_list,$content);
             } else {$linked_list=$next;}
         } while ($next!=0);
-        if ($i>$link_max) { 
+        if ($i>$link_max) {
             $link_max=$i;
             file_put_contents(DATA."link2max",$i);
         }
@@ -3714,7 +4044,7 @@ function find($table,$ID){
                 if ($next==0){
                     return [false,[]];
                 } else {
-                    $linked_list=$next; 
+                    $linked_list=$next;
                 }
             }
         } while ($next!=0);
